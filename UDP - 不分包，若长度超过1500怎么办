@@ -1,0 +1,67 @@
+# UDP协议不分包 。但IP层的最大payload长度为1472Bytes。若UDP信息超过这个数值，该如何处理呢？
+ 
+
+UDP层 不拆分包，但IP层拆分包。若UDP报文长度，超过1472字节，则发送方的 IP层 分包)，会将报文拆分成多个IP报文；接收方的IP层，会将报文进行重组。IP header中有总长度和片偏移。
+
+ 
+
+即MTU（Maximum Transmission Unit）为1500；
+
+在网络层，因为IP包的首部要占用20字节，所以这的MTU为1500－20＝1480；
+
+在传输层，对于UDP包的首部要占用8字节，所以这的MTU为1480－8＝1472；
+
+所以，在应用层，你的Data最大长度为1472。
+
+ 
+
+UDP报文，理论上最大长度65535
+UDP datagram header
+UDP datagram header format
+
+对于UDP协议来说，payload数据长度2^16 - 1 = 65535字节
+
+IP datagram header
+通常没有Options ，故header长度为20字节
+
+IP header format from RFC
+
+对于IP协议来说，payload数据长度2^16 - 1 = 65535字节
+
+UDP in IP 报文
+UDP and IP header format illustration
+
+IP报文payload中包含的UDP的有效载荷 = <  65535 - 8 (UDP header)字节
+
+IP in 以太网报文
+以太网报文中，data部分中包含的UDP有效载荷 =< 1500 -20(IP header)  -8 (UDP header)
+
+以太网frame
+DLL层MTU通常为1518，承受报文最大长度为1500。
+
+See the source image
+
+IP协议分片算法
+意义：在IP协议中的分片算法主要解决不同物理网络最大传输单元(MTU) 的不同造成的传输问题。
+
+分片：IP分片是网络上传输IP报文的一种技术手段。IP协议在传输数据包时，若数据包大小超过MTU，数据报文将被分为若干分片进行传输，并在目标系统中进行重组。这一过程称为分片（fragmentation）。IP报文的header有数据包的ID和分片标识符。
+
+IP层没有超时重传机制，需要由上层协议（传输层或应用层）来处理。
+
+ 
+
+TCP报文header
+通常没有Options ，故header长度为20字节
+
+TCP header segment format
+
+对于TCP协议来说，整个包的最大长度是由最大传输大小（MSS，Maxitum Segment Size）决定，MSS就是TCP数据包每次能够传输的最大数据分段，这个值在SYN协商时确定。对于一个以太网来说，TCP的最大报文段长度即MSS一般是1460字节（1500(MTU) - 20(IP head) - 20(TCP head) = 1460 Byte）
+
+，减去12字节的TCP timestamp option，留给TCP正文数据是 1448字节 。？？
+
+ 
+
+TCP报文分包
+TCP没有限定，TCP包头中就没有“包长度”字段，而完全依靠IP层去处理分帧。这就是为什么TCP常常被称作一种“流协议”的原因，开发者在使用TCP服务的时候，不必去关心数据包的大小，只需讲SOCKET看作一条数据流的入口，往里面放数据就是了，TCP协议本身会进行拥塞/流量控制。
+
+原文:https://blog.csdn.net/weixin_44124323/article/details/106670593
