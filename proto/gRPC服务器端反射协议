@@ -1,0 +1,107 @@
+
+服务器端反射（server reflection）是在 gRPC 服务器端定义的一个服务，它能提供该服务器端上可公开访问的 gRPC 服务的信息。简而言之，服务器端反射向客户端应用程序提供了服务器端所注册的服务的定义信息。因此，客户端不需要预编译服务定义就能与服务进行通信了。
+
+如第 2 章所述，客户端应用程序要连接 gRPC 服务并与其通信，它必须要有服务的服务定义信息。首先需要编译服务定义，并生成对应的客户端存根。随后，需要创建客户端应用程序，调用存根的方法。借助gRPC 服务器端反射，我们无须预编译服务定义就能与服务通信。
+
+当我们构建命令行界面（CLI）工具来调试 gRPC 服务器时，服务器端反射是非常有用的。无须为工具提供服务定义，而只需提供要调用的方法和文本载荷。它会发送二进制载荷到服务器端，并以易于人类阅读的格式将响应返回给用户。为了使用服务器端反射，首先要在服务器端启用它。代码清单 8-3 展示了如何启用服务器端反射功能。
+
+代码清单 8-3 在 Go gRPC 服务器端启用服务器端反射
+
+package main
+
+import (
+    ...
+    pb "productinfo/server/ecommerce"
+    "google.golang.org/grpc"
+    "google.golang.org/grpc/reflection" ➊
+)
+
+func main() {
+    lis, err := net.Listen("tcp", port)
+    if err != nil {
+        log.Fatalf("failed to listen: %v", err)
+    }
+
+    s := grpc.NewServer()
+    pb.RegisterProductInfoServer(s, &server{})
+    reflection.Register(s) ➋
+
+    if err := s.Serve(lis); err != nil {
+        log.Fatalf("failed to serve: %v", err)
+    }
+}
+❶ 导入反射包以访问反射 API。
+❷ 在 gRPC 服务器上注册反射服务。
+服务器端应用程序在启用服务器端反射功能之后，就可以通过 gRPC CLI 工具来检查服务器端了。
+
+gRPC CLI 工具来源于 gRPC 仓库。它支持很多功能，比如列出服务器端的服务和方法，以及通过元数据发送和接收 RPC。在编写本书时，需要通过源代码构建该工具。关于如何构建和使用该工具的详细信息，请参考 gRPC CLI 工具仓库。
+
+通过源代码构建完 gRPC CLI 工具后，就可以使用它来检查服务了。我们通过第 2 章构建的商品管理服务来理解一下它的功能。启动商品管理服务的 gRPC 服务器后，就可以运行 CLI 工具来检索服务信息了。
+
+以下是可以借助 CLI 工具执行的操作。
+
+列出服务
+执行以下命令将列出 localhost:50051 端点所有公开的服务。
+
+$ ./grpc_cli ls localhost:50051
+
+Output:
+ecommerce.ProductInfo
+grpc.reflection.v1alpha.ServerReflection
+列出服务详情
+通过给定服务的全名（按照 <package>.<service> 的格式），执行以下命令能够探查服务详情。
+
+$ ./grpc_cli ls localhost:50051 ecommerce.ProductInfo -l
+
+Output:
+package: ecommerce;
+service ProductInfo {
+rpc addProduct(ecommerce.Product) returns
+(google.protobuf.StringValue) {}
+rpc getProduct(google.protobuf.StringValue) returns
+(ecommerce.Product) {}
+}
+列出方法详情
+通过给定方法的全名（按照 <package>.<service>. 的格式），执行以下命令能够获取方法详情。
+
+$ ./grpc_cli ls localhost:50051 ecommerce.ProductInfo.addProduct -l
+
+Output:
+rpc addProduct(ecommerce.Product) returns
+(google.protobuf.StringValue) {}
+探查消息类型
+通过给定消息类型的全名（按照 <package>.<type> 的格式），执行以下命令能够探查消息类型的详情。
+
+$ ./grpc_cli type localhost:50051 ecommerce.Product
+
+Output:
+message Product {
+    string id = 1[json_name = "id"];
+    string name = 2[json_name = "name"];
+    string description = 3[json_name = "description"];
+    float price = 4[json_name = "price"];
+}
+调用远程方法
+执行以下命令将发送到服务器端的远程调用并获取响应。
+
+调用 ProductInfo 服务中的 addProduct 方法。
+$ ./grpc_cli call localhost:50051 addProduct "name:'Apple', description: 'iphone 11', price: 699"
+
+Output:
+connecting to localhost:50051
+value: "d962db94-d907-11e9-b49b-6c96cfe0687d"
+Rpc succeeded with OK status
+调用 ProductInfo 服务中的 getProduct 方法。
+$ ./grpc_cli call localhost:50051 getProduct "value: 'd962db94-d907-11e9-b49b-6c96cfe0687d'"
+
+Output:
+connecting to localhost:50051
+id: "d962db94-d907-11e9-b49b-6c96cfe0687d"
+name: "Apple"
+description: "iphone 11"
+price: 699
+Rpc succeeded with OK status
+现在，可以在 Go gRPC 服务器端启用服务器端反射，并使用 CLI 工具对其进行测试，还可以在 Java gRPC 服务器端启用服务器端反射。如果你更熟悉 Java，那么可以参考源代码仓库中的 Java 示例。
+
+接下来，我们讨论另外一个很有意思的概念，叫作 gRPC 中间件
+
