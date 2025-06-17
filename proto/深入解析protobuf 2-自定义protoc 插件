@@ -1,0 +1,637 @@
+1介绍
+对于程序员来说，protobuf 可能是绕不去的坎，无论是游戏行业、教育行业，还是其他行业，只要涉及到微服务、rpc 都会用这个进行跨进程通信，但是大多数人在项目开发中其实都只会使用到基础消息结构，并不需要自定义开发。掌握更多高级技巧显然对装逼是很有大帮助的，而且大家都在卷，不了解的更深，怎么卷的过大家。
+
+长江后浪卷前浪，前浪死在沙滩上
+
+读完本文收获：
+
+学习protoc 自定义插件开发流程
+比花卷更卷
+另外说明下HTTP/2 的内容正在创作中，完成了大部分了。没有每周一更不是代表我跑路了，因为项目比较紧，在一直挤时间创作。如果一个月都没更了，说明已经卷死在路上(*￣︶￣)。
+
+
+以后再遇到面试官问grpc 底层原理是什么、HTTP/2 协议是什么、protobuf 的底层原理就可以
+
+
+2protoc 生成pb 代码原理
+看这篇文章之前最好粗略阅读下前面的文章
+
+深入解析protobuf 1-proto3 使用及编解码原理介绍
+
+来开始正题，来看看这个将proto文件生成go 代码的命令。
+
+protoc --go_out=. ./*.proto
+protoc 执行这个会生成go 代码，这个原理是什么呢？
+
+
+还记得我们装完protoc 并不能马上生成代码，还需要装一个东西，命令如下
+
+go install github.com/golang/protobuf/protoc-gen-go@latest
+当protoc 执行命令的时候，插件解析步骤如下
+
+1、解析proto 文件，类似于AST树的解析，将整个proto文件有用的语法内容提取出来
+
+2、将解析的结果转为成二进制流，然后传入到protoc-gen-xx标准输入。也就是说protoc 会去程序执行路径去找protoc-gen-go 这个二进制，将解析结果写入到这个程序的标准输入。如果命令是--go_out，那么找到是protoc-gen-go，如果自己定义一个插件叫xxoo，那么--xxoo_out找到就是protoc-gen-xxoo了。所以我们得确保有这个二进制执行文件，要不然会报找不到的错误。
+
+3、protoc-gen-xx 必须实现从标准输入读取上面解析完的二进制流，然后将得到的proto 信息按照自己的语言生成代码，最后将输出的代码写回到标准输出
+
+4、protoc 接收protoc-gen-xx的标准输出，然后写入文件
+
+实际调用过程中，可以将插件二进制文件放在环境变量PATH中，也可直接通过--plugin=[ plugin-name=plugin-path, ....] 传给protoc
+
+protoc --plugin=protoc-gen-xx=path/to/xx --NAME_out=MY_OUT_DIR
+看到上面的步骤可能有点懵，下面通过例子来熟悉整个流程
+
+3 实践-为每个proto message 添加自定义方法
+1、安装protoc
+
+参考:深入解析grpc源码1-grpc介绍及使用
+
+注意这里也要安装protoc-gen-go，这个demo是在原来生成的xx.pb.go 的文件下拓展，为每个消息添加额外的方法，后面会讲protoc-gen-go 的源码解析及自定义开发
+
+2、创建项目目录
+
+
+demo 为项目目录
+proto 存放proto 文件的地方
+out 为proto编译后生成的go 文件目录
+go.mod 使用go mod init protoc-gen-foo 命令生成
+main.go 项目主文件
+Makefile项目执行脚本，每次敲命令难受，所以直接写Makefile
+3、写一个消息
+
+demo/proto/demo.proto
+
+syntax = "proto3";
+package test;
+option go_package = "/test";
+​
+​
+message User {
+  //用户名
+  string Name = 1;
+  //用户资源
+  map<int32,string> Res=2 ;
+}
+4.写main.go 解析这个文件
+
+package main
+​
+import (
+    "bytes"
+    "fmt"
+    "google.golang.org/protobuf/compiler/protogen"
+    "google.golang.org/protobuf/types/pluginpb"
+    "google.golang.org/protobuf/proto"
+    "io/ioutil"
+    "os"
+)
+​
+func main()  {
+    //1.读取标准输入，接收proto 解析的文件内容，并解析成结构体
+    input, _ := ioutil.ReadAll(os.Stdin)
+    var req pluginpb.CodeGeneratorRequest
+    proto.Unmarshal(input, &req)
+    //2.生成插件
+    opts := protogen.Options{}
+    plugin, err := opts.New(&req)
+    if err != nil {
+        panic(err)
+    }
+​
+    // 3.在插件plugin.Files就是demo.proto 的内容了,是一个切片，每个切片元素代表一个文件内容
+    // 我们只需要遍历这个文件就能获取到文件的信息了
+    for _, file := range plugin.Files {
+        //创建一个buf 写入生成的文件内容
+        var buf bytes.Buffer
+​
+        // 写入go 文件的package名
+        pkg := fmt.Sprintf("package %s", file.GoPackageName)
+        buf.Write([]byte(pkg))
+​
+        //遍历消息,这个内容就是protobuf的每个消息
+        for _, msg := range file.Messages {
+            //接下来为每个消息生成hello 方法
+            
+            buf.Write([]byte(fmt.Sprintf(`
+             func (m*%s)Hello(){
+​
+                }
+             `,msg.GoIdent.GoName)))
+        }
+        //指定输入文件名,输出文件名为demo.foo.go
+        filename := file.GeneratedFilenamePrefix + ".foo.go"
+        file := plugin.NewGeneratedFile(filename, ".")
+​
+        // 将内容写入插件文件内容
+        file.Write(buf.Bytes())
+    }
+​
+    // 生成响应
+    stdout := plugin.Response()
+    out, err := proto.Marshal(stdout)
+    if err != nil {
+        panic(err)
+    }
+​
+    // 将响应写回 标准输入, protoc会读取这个内容
+    fmt.Fprintf(os.Stdout, string(out))
+}
+​
+5.安装自己的插件
+
+在demo 路径下执行下面命令，将生成自定义proto 插件
+
+demo> go install .
+demo> ls $GOPATH/bin | grep protoc
+protoc-gen-foo //自定义
+protoc-gen-go
+6.使用自定义插件生成pb 文件
+
+demo> protoc    --foo_out=./out --go_out=./out ./proto/*.proto
+生成结果
+
+
+demo.pb.go 是protoc-gen-go生成的文件
+demo.foo.go 是我们自定义插件生成的文件
+demo.pb.go
+
+package test
+​
+func (m *User) Hello() {
+​
+}
+至此，一个简单的插件完工
+
+7.优化命令，写入Makefile
+
+如果每次修改插件都要敲几个命令太难受了。所以我们需要写个脚本自动化做这个事情
+
+p:
+    protoc    --foo_out=./out --go_out=./out ./proto/*.proto
+is:
+    go install .
+all:
+    make is
+    make p
+测试下
+
+demo> make all
+make is
+go install .
+make p
+protoc    --foo_out=./out --go_out=./out ./proto/*.proto
+​
+没问题，完美
+
+动图封面
+接下来我们实现一个map 的拷贝方法，假设项目中有这种场景，我们需要将go 结构体传给别人，但是这个map 如果被别人引用，在不同的协程中修改，这可能就悲剧了。map 并发的panic 是无法恢复的，如果线上的话，程序员需要拿去祭天了。
+
+假设结构体是protobuf 的消息结构体，我们实现了一个CheckMap 方法，别人拿到消息结构体，如果里面有map的字段就会有这个方法。在发送给别人时统一调用下，然后拷贝，就不会有问题了。
+
+我们修改内容，如下main.go
+
+package main
+​
+import (
+   "bytes"
+   "fmt"
+   "google.golang.org/protobuf/compiler/protogen"
+   "google.golang.org/protobuf/types/pluginpb"
+   "google.golang.org/protobuf/proto"
+   "io/ioutil"
+   "os"
+)
+​
+func main()  {
+   //1.读取标准输入，接收proto 解析的文件内容，并解析成结构体
+   input, _ := ioutil.ReadAll(os.Stdin)
+   var req pluginpb.CodeGeneratorRequest
+   proto.Unmarshal(input, &req)
+   //2.生成插件
+   opts := protogen.Options{}
+   plugin, err := opts.New(&req)
+   if err != nil {
+      panic(err)
+   }
+​
+   // 3.在插件plugin.Files就是demo.proto 的内容了,是一个切片，每个切片元素代表一个文件内容
+   // 我们只需要遍历这个文件就能获取到文件的信息了
+   for _, file := range plugin.Files {
+      //创建一个buf 写入生成的文件内容
+      var buf bytes.Buffer
+​
+      // 写入go 文件的package名
+      pkg := fmt.Sprintf("package %s", file.GoPackageName)
+      buf.Write([]byte(pkg))
+      content:=""
+      //遍历消息,这个内容就是protobuf的每个消息
+      for _, msg := range file.Messages {
+         mapSrc:=`
+                         newMap:=make(map[%v]%v)
+                     for k,v:=range x.%v {
+                        newMap[k]=v
+                     }
+                            x.%v=newMap
+                  `
+         //遍历消息的每个字段
+         for _,field:=range msg.Fields{
+            //只有map 才这样做
+            if field.Desc.IsMap(){
+               content += fmt.Sprintf(mapSrc,field.Desc.MapKey().Kind().String(),field.Desc.MapValue().Kind().String(), field.GoName,field.GoName)
+            }
+         }
+         buf.Write([]byte(fmt.Sprintf(`
+           func (x *%s) CheckMap() {
+          %s
+           }`, msg.GoIdent.GoName, content)))
+      }
+      //指定输入文件名,输出文件名为demo.foo.go
+      filename := file.GeneratedFilenamePrefix + ".foo.go"
+      file := plugin.NewGeneratedFile(filename, ".")
+​
+      // 将内容写入插件文件内容
+      file.Write(buf.Bytes())
+   }
+​
+   // 生成响应
+   stdout := plugin.Response()
+   out, err := proto.Marshal(stdout)
+   if err != nil {
+      panic(err)
+   }
+​
+   // 将响应写回标准输入, protoc会读取这个内容
+   fmt.Fprintf(os.Stdout, string(out))
+}
+编译
+
+demo >make all
+生成结果
+
+demo/out/test/demo.foo.go
+
+package test
+​
+func (x *User) CheckMap() {
+​
+    newMap := make(map[int32]string)
+    for k, v := range x.Res {
+        newMap[k] = v
+    }
+    x.Res = newMap
+​
+}
+​
+
+
+3 消息结构体大体了解
+file 结构体
+
+// A File describes a .proto source file.
+type File struct {
+   Desc  protoreflect.FileDescriptor
+   Proto *descriptorpb.FileDescriptorProto
+​
+   GoDescriptorIdent GoIdent       // name of Go variable for the file descriptor
+   GoPackageName     GoPackageName // name of this file's Go package
+   GoImportPath      GoImportPath  // import path of this file's Go package
+​
+   Enums      []*Enum      // top-level enum declarations
+   Messages   []*Message   // top-level message declarations
+   Extensions []*Extension // top-level extension declarations
+   Services   []*Service   // top-level service declarations
+​
+   Generate bool // true if we should generate code for this file
+​
+   // GeneratedFilenamePrefix is used to construct filenames for generated
+   // files associated with this source file.
+   //
+   // For example, the source file "dir/foo.proto" might have a filename prefix
+   // of "dir/foo". Appending ".pb.go" produces an output file of "dir/foo.pb.go".
+   GeneratedFilenamePrefix string
+​
+   location Location
+}
+Enums代表文件中的枚举
+Messages代表proto 文件中的所有消息
+Extensions代表文件中的扩展信息
+Services消息中定义的服务，跟grpc 有关
+GeneratedFilenamePrefix 来源proto 文件的前缀，上面有例子，例如"dir/foo.proto"，这个值就是"dir/foo"，后面加上".pb.go"代表最后生成的文件
+Comments字段代表字段上面，后面的注释
+proto 消息Message
+
+// A Message describes a message.
+type Message struct {
+   Desc protoreflect.MessageDescriptor
+​
+   GoIdent GoIdent // name of the generated Go type
+​
+   Fields []*Field // message field declarations
+   Oneofs []*Oneof // message oneof declarations
+​
+   Enums      []*Enum      // nested enum declarations
+   Messages   []*Message   // nested message declarations
+   Extensions []*Extension // nested extension declarations
+​
+   Location Location   // location of this message
+   Comments CommentSet // comments associated with this message
+}
+Fields代表消息的每个字段，遍历这个字段就可以得到字段信息
+Oneofs 代表消息中Oneof结构
+Enums 消息中的枚举
+Messages嵌套消息，消息是可以嵌套消息，所以这个代表嵌套的消息
+Extensions代表扩展信息
+Comments字段代表字段上面，后面的注释
+消息字段Field
+
+// A Field describes a message field.
+type Field struct {
+   Desc protoreflect.FieldDescriptor
+​
+   // GoName is the base name of this field's Go field and methods.
+   // For code generated by protoc-gen-go, this means a field named
+   // '{{GoName}}' and a getter method named 'Get{{GoName}}'.
+   GoName string // e.g., "FieldName"
+​
+   // GoIdent is the base name of a top-level declaration for this field.
+   // For code generated by protoc-gen-go, this means a wrapper type named
+   // '{{GoIdent}}' for members fields of a oneof, and a variable named
+   // 'E_{{GoIdent}}' for extension fields.
+   GoIdent GoIdent // e.g., "MessageName_FieldName"
+​
+   Parent   *Message // message in which this field is declared; nil if top-level extension
+   Oneof    *Oneof   // containing oneof; nil if not part of a oneof
+   Extendee *Message // extended message for extension fields; nil otherwise
+​
+   Enum    *Enum    // type for enum fields; nil otherwise
+   Message *Message // type for message or group fields; nil otherwise
+​
+   Location Location   // location of this field
+   Comments CommentSet // comments associated with this field
+}
+Desc 代表该字段的描述
+GoName代表字段名
+Parent代表父消息
+Comments字段代表字段上面，后面的注释
+4 实践-获取options 扩展
+前面关于protobuf 使用的文章关注度挺低的，可能是大多数是翻译官网的吧。
+
+
+比如有个扩展选项的内容，大家即使读完我的翻译可能还是很懵，下面我们会自己开发一个自定义options来熟悉整个流程。
+
+1、创建扩展
+
+不了解这个扩展的同学可能需要去读下文档
+
+深入解析protobuf 1-proto3 使用及编解码原理介绍或者官网Protocol Buffers，自定义扩展选项快捷路径Custom Options
+
+首先创建一个ext 文件夹，创建扩展文件夹名
+
+
+my_ext.proto
+
+自定义的选项需要扩展google.protobuf.FieldOptions
+
+syntax = "proto2";
+​
+package ext;
+option go_package = "/my_ext";
+import "google/protobuf/descriptor.proto";
+extend google.protobuf.FieldOptions {
+  optional bool flag = 65004;
+  optional string jsontag = 65005;
+}
+修改demo.proto，添加自定义选项
+
+syntax = "proto3";
+package test;
+option go_package = "/test";
+import "proto/ext/my_ext.proto";
+message User {
+  //用户名
+  string Name = 1 [ (ext.flag)=true];//添加选项flag
+  //用户资源
+  map<int32,string> Res=2 [ (ext.jsontag)="res"]; //添加选项jsontag
+}
+上面的[]内容就是我们自定义的选项
+
+2、编译
+
+下面修改Makefile ,将ext文件夹也添加进去
+
+p:
+   protoc    --foo_out=./out --go_out=./out ./proto/*.proto ./proto/ext/*.proto
+is:
+   go install .
+all:
+   make is
+   make p
+接下来来编译
+
+demo>make all
+结果为
+
+
+在my_ext.pb.go有两句重要代码，我们等会会用到。
+
+// Extension fields to descriptorpb.FieldOptions.
+var (
+   // optional bool flag = 65004;
+   E_Flag = &file_proto_ext_my_ext_proto_extTypes[0]
+   // optional string jsontag = 65005;
+   E_Jsontag = &file_proto_ext_my_ext_proto_extTypes[1]
+)
+3、在自定义插件获取选项的值
+
+我们修改main.go ，将选项值生成出来
+
+package main
+​
+import (
+    "bytes"
+    "fmt"
+    "google.golang.org/protobuf/compiler/protogen"
+    "google.golang.org/protobuf/proto"
+    "google.golang.org/protobuf/types/descriptorpb"
+    "google.golang.org/protobuf/types/pluginpb"
+    "io/ioutil"
+    "os"
+    "protoc-gen-foo/out/my_ext"
+)
+​
+func main()  {
+    //1.读取标准输入，接收proto 解析的文件内容，并解析成结构体
+    input, _ := ioutil.ReadAll(os.Stdin)
+    var req pluginpb.CodeGeneratorRequest
+    proto.Unmarshal(input, &req)
+    //2.生成插件
+    opts := protogen.Options{}
+    plugin, err := opts.New(&req)
+    if err != nil {
+        panic(err)
+    }
+​
+    // 3.在插件plugin.Files就是demo.proto 的内容了,是一个切片，每个切片元素代表一个文件内容
+    // 我们只需要遍历这个文件就能获取到文件的信息了
+    for _, file := range plugin.Files {
+        //创建一个buf 写入生成的文件内容
+        var buf bytes.Buffer
+​
+        // 写入go 文件的package名
+        pkg := fmt.Sprintf("package %s", file.GoPackageName)
+        buf.Write([]byte(pkg))
+        context:=""
+        //遍历消息,这个内容就是protobuf的每个消息
+        for _, msg := range file.Messages {
+            //遍历消息的每个字段
+            for _,field:=range msg.Fields{
+                op,ok:=field.Desc.Options().(*descriptorpb.FieldOptions)
+                if ok{
+                    value:=GetJsonTag(op)
+                    context+=fmt.Sprintf("%v\n",value)
+                    value=GetFlagTag(op)
+                    context+=fmt.Sprintf("%v\n",value)
+                }
+​
+            }
+            buf.Write([]byte(fmt.Sprintf(`
+           func (x *%s) optionsTest() {
+            %s
+           }`, msg.GoIdent.GoName, context)))
+        }
+        //指定输入文件名,输出文件名为demo.foo.go
+        filename := file.GeneratedFilenamePrefix + ".foo.go"
+        file := plugin.NewGeneratedFile(filename, ".")
+​
+        // 将内容写入插件文件内容
+        file.Write(buf.Bytes())
+    }
+​
+    // 生成响应
+    stdout := plugin.Response()
+    out, err := proto.Marshal(stdout)
+    if err != nil {
+        panic(err)
+    }
+​
+    // 将响应写回标准输入, protoc会读取这个内容
+    fmt.Fprintf(os.Stdout, string(out))
+}
+func GetJsonTag(field *descriptorpb.FieldOptions) interface{} {
+    if field == nil {
+        return ""
+    }
+    v:= proto.GetExtension(field,my_ext.E_Jsontag)
+    return v.(string)
+}
+func GetFlagTag(field *descriptorpb.FieldOptions) interface{} {
+    if field == nil {
+        return ""
+    }
+    if !proto.HasExtension(field, my_ext.E_Flag){
+        return ""
+    }
+    v:= proto.GetExtension(field,my_ext.E_Flag)
+    return v.(bool)
+}
+编译
+
+demo>make all
+结果
+
+demo/out/test/demo.foo.go
+
+func (x *User) optionsTest() {
+    true //flag 的值
+    res //jsontag 的值
+}
+这个例子只是展示如何获取选项的值，并不是完整的demo。
+
+4、内容优化
+
+因为扩展都是固定，提前定义好的，所以我们并不需要和业务proto 一起编译，我们将扩展文件夹的结构变为如下，将刚刚生成的扩展文件移动到ext里面来。
+
+
+helper.go内容
+
+package ext
+​
+import (
+   "google.golang.org/protobuf/proto"
+   "google.golang.org/protobuf/types/descriptorpb"
+)
+​
+//获取JsonTag 的值
+func GetJsonTag(field *descriptorpb.FieldOptions) interface{} {
+   if field == nil {
+      return ""
+   }
+   v:= proto.GetExtension(field, E_Jsontag)
+   return v.(string)
+}
+//获取flag 的值
+func GetFlagTag(field *descriptorpb.FieldOptions) interface{} {
+   if field == nil {
+      return ""
+   }
+    //判断字段有没有这个选项
+   if !proto.HasExtension(field, E_Flag){
+      return ""
+   }
+    //有的话获取这个选项值
+   v:= proto.GetExtension(field, E_Flag)
+   return v.(bool)
+}
+main.go
+
+            .....
+             //遍历消息的每个字段
+            for _,field:=range msg.Fields{
+                op,ok:=field.Desc.Options().(*descriptorpb.FieldOptions)
+                if ok{
+                    value:=ext.GetJsonTag(op)
+                    context+=fmt.Sprintf("%v\n",value)
+                    value=ext.GetFlagTag(op)
+                    context+=fmt.Sprintf("%v\n",value)
+                }
+...
+            }
+..
+5文件优化
+
+经过上面的操作，读者可能有疑惑，多出来的几个文件是错误的，怎么去掉多余的文件。
+
+
+文件1出现的原因是系统的默认消息也被加进来了，protoc-gen-go 是不会解析这个文件，但是我们的插件没有过滤
+
+文件2出现的原因是执行命令，protoc 把所有文件都解析出来，包括ext里面的proto 文件，但是protoc-gen-go 在解析时并不会递归解析子文件，原因是也做了过滤操作，所以我们也可以这样做。
+
+protoc    --foo_out=./out --go_out=./out ./proto/*.proto
+解决这个问题，我们只需要将这些文件忽略掉
+
+在循环遍历file 的时候，continue，如下，跳过不该出现的文件
+
+// 3.在插件plugin.Files就是demo.proto 的内容了,是一个切片，每个切片元素代表一个文件内容
+    // 我们只需要遍历这个文件就能获取到文件的信息了
+    for _, file := range plugin.Files {
+        if strings.Contains(file.Desc.Path(),"my_ext.proto"){
+            continue
+        }
+        if strings.Contains(file.Desc.Path(),"descriptor.proto"){
+            continue
+        }
+        ....
+        }
+再生成一下，可以发现到我们要的目的了
+
+
+5protoc-gen-go 介绍
+相信经过上面的实践后，大家对protoc 插件有更深刻的认识了，如果我们使用命令如下
+
+protoc    --foo_out=./out  ./proto/*.proto
+那么结局就只会生成一个文件了，demo.foo.go
+
+所以protoc-gen-go 是一个实现更完善的插件，整个解析流程是一样的，只不过在生成pb 文件做了更多事情，如果你想更加深入学习的话，那么就可以去官方下载源码找自己感兴趣的部分看看了。下期将带来protoc-gen-go源码解析，如果大家喜欢的话不要忘记点赞。
+
+动图封面
