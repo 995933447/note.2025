@@ -1,0 +1,780 @@
+前面已经讲了grpc基础使用，其中用到了Protocol buffers，这次先讲下Protocol Buffers的基本使用，和编解码原理。后面会有高级教程讲如何二次开发proto-gen-go ，protobuf 官方功能并不是很完善的，在日常项目中，常常有自定义需求，更多的是使用官方protoc-gen-go 这个项目fork 后自定义版本，或者是比较优秀的开源 fork 版本。目前使用最多的是gogo protobuf，后面都会出详细教程。本文章内容几乎翻译整理自官方文档，额外添加了go相关的例子,可以当成学习和平时开发文档使用。
+
+1proto 命令
+目前使用的proto 都是proto3，在定义proto 的时候最上面添加syntax = "proto3"，这个标识
+
+官网proto3：https://developers.google.com/protocol-buffers/docs/proto3
+官网proto2: https://developers.google.com/protocol-buffers/docs/proto(几乎不用)
+在前面我们已经用demo 演示了如何使用Proto Buffer了，接下来我们具体讲讲protobuf。
+
+Protocol buffers是Google用于序列化结构化数据的语言中立、平台中立、可扩展的机制，比如XML，json，但更小、更快、更简单。只需定义一次数据的结构化方式，然后就可以使用生成的特殊源代码轻松地在各种数据流之间以及使用各种语言编写和读取结构化数据。
+
+下面来看下protoc 的命令
+
+protoc --proto_path=IMPORT_PATH --cpp_out=DST_DIR --java_out=DST_DIR --python_out=DST_DIR --go_out=DST_DIR --ruby_out=DST_DIR --objc_out=DST_DIR --csharp_out=DST_DIR path/to/file.proto
+IMPORT_PATH指定寻找proto 的目录去解决import 带来的依赖问题，如果省略，默认是当前文件夹。多个import 文件夹可以通过参数使用--proto_path多次来解决，编译器将会按顺序搜索。也可以用简写-I=IMPORT_PATH来表示--proto_path
+--cpp_out，--java_out，--go_out等等代表指定生成的语言，可以生成多个语言
+path/to/file.proto 代表输入的proto 文件，可以用*.proto 代表输入文件夹内多个文件
+具体使用例子看下面：导入其他文件proto
+
+D:\Output\grpc\demo\protobuf\otherMessage\protos>protoc -I=business -I=share --go_out=. ./share/*.proto //用-I 参数导入import的proto 包
+2protobuf 字段介绍
+如果我们需要定义一个搜索相关的proto 消息，请求有 查询字符串，有分页页数，和每页的数量。例子如下
+
+message SearchRequest {
+  string query = 1;  // 查询字符串
+  optional int32 page_number = 2;  // 第几页
+  optional int32 result_per_page = 3;  // 每页的结果数
+}
+每个消息应该有类型和字段编号
+optional: message 可以包含该字段零次或一次（不超过一次）。
+repeated: 该字段可以在消息中重复任意多次（包括零）。其中重复值的顺序会被保留。在开发语言中就是数组和列表
+字段类型
+字段有很多数据类型，在下面会详细讲解，看个常用游戏角色例子
+
+syntax = "proto3";
+option go_package = "protos/pbs";
+enum Status{
+  Status1=0;
+  Status2=1;
+  Status3=2;
+}
+//玩家资源
+message Res {
+  //金条
+  int64 Gold  =1;
+  //钞票
+  int64 Money =2;
+}
+message Role {
+  //id
+  int64  Id =1; //有符号整型
+  //姓名
+  string Name=2;//字符串类型
+  //属性
+  map<int64,int64> Attr=3; //map 类型
+  //状态
+  Status typ =4;   //枚举类型
+  //是不是vip
+  bool IsVip =5; //bool 类型
+  //资源
+  Res Res=6;     //复合类型
+}
+​
+字段编号
+每个字段有唯一编号，在二进制流中标识字段，可以看后面protobuf 编解码原理去了解字段的作用。
+消息被使用了，字段就不能改了，改了会造成数据错乱（常见坑)，服务器和客户端很多bug，是proto buffer 文件更改，未使用更改后的协议导致。
+1 到 15 范围内的字段编号需要一个字节进行编码，编码结果将同时包含编号和类型
+16 到 2047 范围内的字段编号占用两个字节。因此，非常频繁出现的 message 元素保留字段编号 1 到 15。
+字段最小数字为1，最大字段数为2^29 - 1。（原因在编码原理那章讲解过，字段数字会作为key，key最后三位是类型）
+19000 through 19999 (FieldDescriptor::kFirstReservedNumber through FieldDescriptor::kLastReservedNumber这些数字不能用，这些是保留字段，如果使用会编译器会报错
+syntax = "proto3";
+option go_package = "protos/pbs";
+​
+message Role {
+  int64  Id =19527;
+}
+编译会报下面的错
+
+D:\Output\grpc\demo\protobuf\intro\proto>protoc --go_out=. ./*.proto
+intro.proto:5:14: Field numbers 19000 through 19999 are reserved for the protocol buffer library implementati
+on.
+保留字段指 reserved 关键字指定的字段
+3protobuf数据类型
+3.1变量类型
+
+
+
+java中，无符号32 位和64位使用其有符号类型表示。最高位是符号位
+所有场景中，给字段赋值都会给类型检查确保它是有效的
+64 位或无符号 32 位整数在解码时始终表示为 long，但如果在设置字段时给出 int，则可以为int
+默认值
+解析消息的时候，编码的消息字段没有赋值，将会设置默认值
+
+字符串类型默认值是" "
+bytes 默认值是空字节
+bool 默认值是false
+数字类型默认是0
+枚举值默认是0，详情看下面枚举类型
+空列表在合适的语言会转换成合适的数据类型空列表
+枚举
+如何定义枚举？如下，当我们想定义一个消息类型，只使用定义好的一系列值的一个，我们就可以使用枚举
+
+message SearchRequest {
+  string query = 1;
+  int32 page_number = 2;
+  int32 result_per_page = 3;
+  enum Corpus { //定义枚举
+    UNIVERSAL = 0;
+    WEB = 1;
+    IMAGES = 2;
+    LOCAL = 3;
+    NEWS = 4;
+    PRODUCTS = 5;
+    VIDEO = 6;
+  }
+  Corpus corpus = 4; //使用枚举
+}
+注意：
+
+枚举第一个字段必须是0，像上面UNIVERSAL = 0，而且不能省略，原因有两点：
+
+当该枚举类型字段没有赋值的时候，我们使用0这个定义作为默认值
+兼容proto2 第一个字段总是默认值
+如何给枚举定义别名? 当我们希望两个枚举值一样，但是变量名不一样的时候，我们可以添加allow_alias option，并设置值为true，类似于下面这个样式，要不然编译器会报错。
+
+message MyMessage1 {
+  enum EnumAllowingAlias {
+    option allow_alias = true;
+    UNKNOWN = 0;
+    STARTED = 1;
+    RUNNING = 1;
+  }
+}
+message MyMessage2 {
+  enum EnumNotAllowingAlias {
+    UNKNOWN = 0;
+    STARTED = 1; //直接使用会报错，因为这两个值一样了
+    // RUNNING = 1;  // Uncommenting this line will cause a compile error inside Google and a warning message outside.
+  }
+}
+枚举值范围是32位范围内的整数，这是因为是是varint encoding 编码的。对于没有定义的枚举值，在go 和c++中会识别成数字，如下：
+
+pbs
+
+syntax = "proto3";
+option go_package = "protos/pbs";
+enum TestType {
+  Hello1=0;
+  Hello2=1;
+  Hello3=2;
+  Hello4=3;
+}
+
+message HelloRequest {
+  string greeting = 1;
+  TestType en=2;
+}
+
+message HelloResponse {
+  string reply = 1;
+}
+main.go
+
+package main
+
+import (
+   "fmt"
+   "google.golang.org/protobuf/proto"
+   "grpcdemo/protobuf/enum/protos/pbs"
+)
+
+func main()  {
+   req:=pbs.HelloRequest{
+      En: pbs.TestType(9999),
+   }
+   data,err:=proto.Marshal(&req)
+   if err!=nil{
+      panic(err)
+   }
+   newReq:=pbs.HelloRequest{}
+   err =proto.Unmarshal(data,&newReq)
+   if err!=nil{
+      panic(err)
+   }
+   fmt.Println(newReq.En) //9999
+   fmt.Println(int32(newReq.En)) //9999
+}
+枚举保留字段
+为了提高枚举更新的安全性，官方新增了个枚举保留字段，使用方法如下,
+
+enum Foo {
+  reserved 2, 15, 9 to 11, 40 to max;
+  reserved "FOO", "BAR";
+}
+如果删除枚举定义或者注释来更新枚举类型，将来用户可能不注意去重用该类型的值，如果以后proto buffer 版本更新了，再加载到旧版本，那么可能导致严重问题，包括数据损坏、隐私漏洞等。
+
+官方提供了保留字段，可以保留枚举字段名和枚举字段值，如下，使用保留的字段会报错，超过max 也会报错。
+
+编译器在编译时就会报错，我这里用了个语法插件，红色的代表语法不通过。
+
+
+
+
+
+
+定义:
+
+enum TestType {
+  Hello1=0;
+  Hello2=1;
+  Hello3=2;
+  Hello4=3;
+  FOO=4;
+  BAR=5;
+  foo=6;
+  Bar=7;
+
+  Foo1=8;
+  Hello6=39;
+  Hello6=40;
+  Hello5=99;
+  reserved 2,3, 15, 9 to 11, 40 to max;
+  reserved "FOO", "BAR";
+}
+消息嵌套和导入其他文件proto
+消息引用
+当使用其他消息的时候，如果在本文件，直接使用就可以了。Result代表自定义消息类型
+
+message SearchResponse {
+  repeated Result results = 1;
+}
+
+message Result {
+  string url = 1;
+  string title = 2;
+  repeated string snippets = 3;
+}
+消息嵌套
+如何在消息里面再定义消息了?例子如下，在SearchResponse定义了个内部消息Result，然后直接引用就可以了。
+
+message SearchResponse {
+  message Result {
+    string url = 1;
+    string title = 2;
+    repeated string snippets = 3;
+  }
+  repeated Result results = 1;
+}
+如果其他消息引用消息内部的消息呢？语法为_Parent_._Type_
+
+message SomeOtherMessage {
+  SearchResponse.Result result = 1;
+}
+你可以嵌套多层消息，只要你喜欢
+
+message Outer {                  // Level 0
+  message MiddleAA {  // Level 1
+    message Inner {   // Level 2
+      int64 ival = 1;
+      bool  booly = 2;
+    }
+  }
+  message MiddleBB {  // Level 1
+    message Inner {   // Level 2
+      int32 ival = 1;
+      bool  booly = 2;
+    }
+  }
+}
+导入其他文件proto
+在项目开发中，我们有这种需要，将相同的结构放在一个公共文件夹，将请求响应的业务消息放一个文件夹，然后请求响应的proto 会引用通文件夹。我们来写一个例子，文件结构如下。
+
+bussiness 代表业务文件夹，里面存放业务逻辑
+share 存放公共结构文件夹
+
+
+
+
+
+
+
+user_business.proto
+
+syntax = "proto3";
+option go_package = "protos/pbs";
+import "share/user.proto";
+//获取角色信息请求
+message GetUserRequest {
+
+}
+//获取角色信息响应
+message GetUserResponse {
+  User user=1;
+}
+
+
+user.proto
+
+syntax = "proto3";
+option go_package = "protos/pbs";
+
+//用户定义
+message User {
+	string Id=1;
+	string Name=2;
+	string Age=3;
+}
+接下来编译，这样就可以愉快的使用编译好的proto 信息了
+
+D:\Output\grpc\demo\protobuf\otherMessage\protos>protoc --go_out=. ./business/*.proto ./share/*.proto
+
+
+Any
+官方说作用是集成proto 没有定义的类型，其实可以理解为go 语言接口类型，可以存任何类型的值，但是跨语言只能通过字节流代表任意类型，所以any 内部实现包含字节流，和标识字节流的唯一url。
+
+用这个关键字，官方说要导入官方proto，类似下面，相信如果直接编译肯定会有坑，编译不过，因为没有any.proto这个文件，那么我们去哪里找呢？
+
+import "google/protobuf/any.proto";
+
+message ErrorStatus {
+  string message = 1;
+  repeated google.protobuf.Any details = 2;
+}
+方法一：去官方下载这个文件
+
+https://github.com/protocolbuffers/protobuf/blob/master/src/google/protobuf/any.proto
+
+方法二：还记得第一章我们安装protobuf的时候吗，下载下来的除了二进制还有有个包含proto的目录，如下
+
+
+
+
+
+
+所以我们将文件复制到自己的proto 目录，再编译下
+
+D:\Output\grpc\demo\protobuf\any>protoc --go_out=. ./proto/*.proto ./google/protobuf/*.proto
+最后序列化出来的any 结构包含下面两个字段:
+
+TypeUrl string `protobuf:"bytes,1,opt,name=type_url,json=typeUrl,proto3" json:"type_url,omitempty"`
+// Must be a valid serialized protocol buffer of the above specified type.
+Value []byte `protobuf:"bytes,2,opt,name=value,proto3" json:"value,omitempty"`
+一个是序列化成bytes 的属性value
+一个是标识这个属性全局唯一的标识TypeUrl
+
+
+Oneof
+如果在平时在一个消息有许多字段，但是最多设置一个字段，我们可以使用oneof 来执行并节省内存。
+
+Oneof 字段类似于常规字段，除了Oneof共享内存的所有字段之外，最多可以同时设置一个字段。设置Oneof 的任何成员都会自动清除所有其他成员。您可以使用case()或WhichOneof()方法检查Oneof 中的哪个值被设置(如果有的话)，具体取决于选择的语言。
+
+syntax = "proto3";
+option go_package = "protos/pbs";
+
+message SubMessage {
+  int32 Id=1;
+  string Age2=2;
+
+}
+message SampleMessage {
+  oneof test_oneof {
+    string name = 4;
+    SubMessage sub_message = 9;
+  }
+}
+
+oneof 可以添加任何字段，除了repeated字段
+
+oneof 功能：
+
+oneof 设置一个字段会清除其他字段，如果设置了几个字段，自会保留最后一个设置的字段，可以看到在go中是通过一个接口类型来做到oneof的，只能给这个字段赋值为定义的字段结构体。
+package main
+
+import (
+	"fmt"
+	"grpcdemo/protobuf/any/protos/pbs"
+)
+
+func main()  {
+
+	p:=&pbs.SampleMessage{
+		TestOneof: &pbs.SampleMessage_Name{Name: "hello"},
+	}
+
+	fmt.Println(p)
+	fmt.Println(p.GetTestOneof())
+	p.TestOneof=&pbs.SampleMessage_SubMessage{SubMessage: &pbs.SubMessage{Id: 1}}
+	fmt.Println(p)
+	fmt.Println(p.GetTestOneof())
+}
+
+oneof 不能被repeated
+反射作用于oneof的字段
+兼容性问题
+
+添加或删除其中一个字段时要小心。如果检查 oneof 的值返回 None/NOT_SET，则可能意味着 oneof 尚未设置或已设置为 oneof 的另一个字段。这种情况是无法区分的，因为无法知道未知字段是否是 oneof 成员。
+
+标签重用问题
+
+将 optional 可选字段移入或移出 oneof：在序列化和解析 message 后，你可能会丢失一些信息（某些字段将被清除）。但是，你可以安全地将单个字段移动到新的 oneof 中，并且如果已知只有一个字段被设置，则可以移动多个字段。
+删除 oneof 字段并将其重新添加回去：在序列化和解析 message 后，这可能会清除当前设置的 oneof 字段。
+拆分或合并 oneof：这与移动常规的 optional 字段有类似的问题。
+Maps
+在数据定义创建map，语法格式为
+
+map<key_type, value_type> map_field = N;
+例如，创建一个项目，key 是string，value 是Project
+
+map<string, Project> projects = 3;
+注意事项：
+
+map 类型不能加repeated，简单来说map 是不支持map 数组的
+map是无序的，不能依赖map 的特定顺序
+总的来说，map 语法等价于下面的语法，所以protocol buffers 的实现在不支持map 的语言上也能处理数据
+
+message MapFieldEntry {
+  key_type key = 1;
+  value_type value = 2;
+}
+
+repeated MapFieldEntry map_field = N;
+任何支持protocol buffers实现的map都必须接受上面的定义
+
+Packages
+package 提供命名空间避免冲突，类似于下面这样
+
+package foo.bar;
+message Open { ... }
+在其他地方引用
+
+message Foo {
+  ...
+  foo.bar.Open open = 1;
+  ...
+}
+JSON Mapping
+protobuf 也提供经典的json 编码，使不同系统交流更容易。
+
+如果json 值缺失或者值是null，解析成proto buffer 将会选择默认的值，如果一个字段在proto buffer 是默认值，那么该字段在json解析将会被省略，这样在解析json 时使用默认值更节省空间。可以使用选项在解析json 的时候不省略字段。
+
+下面是类型对象的表：
+
+
+
+proto3 有下面的选项：
+
+使字段可以带默认值： 字段默认值被省略默认在proto3 转换为json 输出，应该提供选项覆盖默认行为，让输出字段带默认值
+忽略未知字段： proto3 json 解析应该拒绝未知字段的默认值，通过选项忽略未知字段解析
+使用proto 字段名代替小驼峰命名： proto3 json 打印应该转换字段名为小驼峰作为Json 名，通过选项可以让转换的json 名可以是小驼峰也可以是字段名
+使枚举值是整形而不是字符串： 默认是使用枚举的变量值作为json输出的，可以使用选项使用枚举的数字值代替
+然而并没有看到支持上面相关使用例子(*￣︶￣)，但是我们有时候有这种需要，这里有一个开源扩展去完成上面的事情。后面会介绍更强大的扩展工具
+
+https://github.com/favadi/protoc-go-inject-tag
+
+Options
+可用的选项列表在google/protobuf/descriptor.proto
+其它选项官方有，是其它语言相关的，这里就不细讲了，看官方文档Options。
+deprecated选项： 设为true 代表字段被废弃，在新代码不应该被使用，在大多数语言都没有实际的效果，在java 变成@Deprecated注解。 在未来，可能产生废弃的注解在方法字段的入口。并且将会引起警告当编译这个字段的时候。如果这个字段没人使用，可以将字段的声明改为保留字段，上面已经讲解
+int32 old_field = 6 [deprecated = true];
+
+
+Custom Options
+proto buffer 提供大多人都不会使用的高级功能-自定义选项。
+
+由于选项是由 google/protobuf/descriptor.proto（如 FileOptions 或 FieldOptions）中定义的消息定义的，因此定义你自己的选项只需要扩展这些消息。
+
+如何定义一个选项？
+
+import "google/protobuf/descriptor.proto";
+
+extend google.protobuf.MessageOptions {
+  optional string my_option = 51234;
+}
+
+message MyMessage {
+  option (my_option) = "Hello world!";
+}
+获取选项
+
+package main
+
+import (
+   "fmt"
+   "grpcdemo/protobuf/any/protos/pbs"
+)
+
+func main()  {
+
+   p:=&pbs.MyMessage{}
+
+   fmt.Println(p.ProtoReflect().Descriptor().Options())
+   //[my_option]:"Hello world!"
+}
+Protocol Buffers可以为每种类型提供选项
+
+import "google/protobuf/descriptor.proto";
+
+extend google.protobuf.FileOptions {
+  optional string my_file_option = 50000;
+}
+extend google.protobuf.MessageOptions {
+  optional int32 my_message_option = 50001;
+}
+extend google.protobuf.FieldOptions {
+  optional float my_field_option = 50002;
+}
+extend google.protobuf.OneofOptions {
+  optional int64 my_oneof_option = 50003;
+}
+extend google.protobuf.EnumOptions {
+  optional bool my_enum_option = 50004;
+}
+extend google.protobuf.EnumValueOptions {
+  optional uint32 my_enum_value_option = 50005;
+}
+extend google.protobuf.ServiceOptions {
+  optional MyEnum my_service_option = 50006;
+}
+extend google.protobuf.MethodOptions {
+  optional MyMessage my_method_option = 50007;
+}
+
+option (my_file_option) = "Hello world!";
+
+message MyMessage {
+  option (my_message_option) = 1234;
+
+  optional int32 foo = 1 [(my_field_option) = 4.5];
+  optional string bar = 2;
+  oneof qux {
+    option (my_oneof_option) = 42;
+
+    string quux = 3;
+  }
+}
+
+enum MyEnum {
+  option (my_enum_option) = true;
+
+  FOO = 1 [(my_enum_value_option) = 321];
+  BAR = 2;
+}
+
+message RequestType {}
+message ResponseType {}
+
+service MyService {
+  option (my_service_option) = FOO;
+
+  rpc MyMethod(RequestType) returns(ResponseType) {
+    // Note:  my_method_option has type MyMessage.  We can set each field
+    //   within it using a separate "option" line.
+    option (my_method_option).foo = 567;
+    option (my_method_option).bar = "Some string";
+  }
+}
+引用其他包的选项需要加上包名
+
+// foo.proto
+import "google/protobuf/descriptor.proto";
+package foo;
+extend google.protobuf.MessageOptions {
+  optional string my_option = 51234;
+}
+// bar.proto
+import "foo.proto";
+package bar;
+message MyMessage {
+  option (foo.my_option) = "Hello world!";
+}
+自定义选项是扩展名，必须分配字段号，像上面的例子一样。在上面的示例中，使用了 50000-99999 范围内的字段编号。这个字段范围供个人组织使用，所以可以内部用。
+在公共应用使用的话，要保持全球唯一数字，需要申请，申请地址为： protobuf global extension registry
+通常只需要一个扩展号，可以多个选项放在子消息中来实现一个扩展号声明多个选项
+message FooOptions {
+  optional int32 opt1 = 1;
+  optional string opt2 = 2;
+}
+
+extend google.protobuf.FieldOptions {
+  optional FooOptions foo_options = 1234;
+}
+
+// usage:
+message Bar {
+  optional int32 a = 1 [(foo_options).opt1 = 123, (foo_options).opt2 = "baz"];
+  // alternative aggregate syntax (uses TextFormat):
+  optional int32 b = 2 [(foo_options) = { opt1: 123 opt2: "baz" }];
+}
+每种选项类型（文件级别，消息级别，字段级别等）都有自己的数字空间，例如：可以使用相同的数字声明 FieldOptions 和 MessageOptions 的扩展名。
+
+rpc 服务
+我们可以定义远程调用服务rpc，一般是下面这样，最直接使用的rpc 系统就是grpc了。
+
+service SearchService {
+  rpc Search(SearchRequest) returns (SearchResponse);
+}
+
+
+3.2编解码原理
+虽然我们在写一个应用的时候不用明白底层原理，但是懂这些原理可以让我们理解proto buffer 序列化方式为什么跟其他编解码不一样，效率为什么这么高。
+
+Base 128 Varints
+这是Google 官方提出的一种编码方法，可变字节长度编码，用一个字节或者多个字节表示整数类型，更小的数占用更小的字节。
+
+编码的理念是：越小的数字花费越少的字节
+
+来看看下面的例子：
+
+00000000 00000000 00000000 00000001 //int32 
+假设值为1 ,类型为int32 在网络传输，其实有效位就一个，其他的位都是无效的，Base 128 Varints的出现就是为了解决这个问题
+Base 128 Varints原理
+
+除了最后一个字节，varint的最高位设置为1，表示后面还有字节出现
+每个字节的低7位为一个组，这个组和下一个组的低7位组合来表示一个整数
+例如数字1，用0000 0001表示，编码后还是0000 0001，最高位没有设置
+例如数字300，编码后用1010 1100 0000 0010表示，总共两个字节，我们怎么计算出300呢，首先最高位为1，代表后面有更多字节，第二个字节最高位为0，说明这就两个字节了。 1010 1100 0000 0010 → 010 1100 000 0010
+1、首先我们丢掉第一个字节的最高位得到： 010 1100
+
+2、丢掉第二个字节的最高位得到： 000 0010
+
+3、最低有效组在前面，倒过来组合，得到0000010 0101100（即十进制的300）
+
+000 0010  010 1100
+→  000 0010 ++ 010 1100
+→  100101100
+→  256 + 32 + 8 + 4 = 300
+用Base 128 Varint编码的最大表示数为2^28，因为每个字节都要少一位，这种算法用来编码最小数字，如果数字较大就不推荐了。
+Base 128 Varint编码存储最大数字为：2^（总位数-字节数)
+消息编码
+protocol buffer消息是由一些key-value 组成的，其中key 代表字段后面的数字，变量名和变量类型仅仅决定编码的最终截止位置。
+
+消息编码的时候，key 和value 都会被编码进字节流。当解码器解码时，需要跳过不能识别的字段，因为新添加字段不会对原来造成影响。每个key 由两部分组成，1个是定义在proto消息字段后面的数字，后面跟的是wire type （消息类型)。通过消息类型能够找到后面值的长度。
+
+可用的wire type
+
+
+
+
+每个key 在消息流里面都是这样的结构，(field_number << 3) | wire_type，最后三位存储wire_type，直白来说，wire_type类似语言中的数据类型，标识存储数据的长度。
+
+下面通过例子来看看如何解码。
+
+解码例子
+假设有下面这种消息类型Test1
+
+message Test1 {
+  optional int32 a = 1;
+}
+当我们定义上面的消息，并赋值a=150，我们将得到下面序列化结构，总共三个字节
+
+08 96 01
+解码步骤：
+
+1、数据流第一个数字是 varint key，这里是08，二进制数据为000 1000
+
+最后三位000是wire_type(0)，右移三位得到000 1（1），所以知道了字段1和后面的值是varint 类型
+将96 01 通过上面的Base 128 Varints解码方法得到数字150
+96 01 = 1001 0110  0000 0001
+       → 000 0001  ++  001 0110 (drop the msb and reverse the groups of 7 bits)
+       → 10010110
+       → 128 + 16 + 4 + 2 = 150
+有符号整形
+在上面的例子中，类型都是varints (wire_type 为0)，但是在sint32 、sint64和标准的int32 和int64 有点不同在负数上面。
+
+如果用int32 和int64 去编码负数的话，结果总是10个字节长
+如果将负数变成比较大的有符号整数就更有效率了，在使用有符号类型的时候，会使用一种效率更高的叫ZigZag 算法去编码
+ZigZag 将有符整数变成绝对值更小的无符号整数，例如-1变成1，1变成2，-2变成3，结果如下面这张表
+
+在sint32 中，n 编码成
+
+(n << 1) ^ (n >> 31)
+sint64 n 编码为
+
+(n << 1) ^ (n >> 63)
+当n>>31 位时，要么所有位都是零（正数），要么是1（是负数的时候）
+
+解码的时候，会被还原成原来的有符号类型。
+
+Non-varint 数字
+double and fixed64 用的wire type 是1，编译器解析时会认为是64位的块数据。直接取64位解析，没有varint 编解码过程。
+float and fixed32使用wire type 5,告诉编译器是32位的数据
+该数字都被排成小端字节序了
+字符串编码
+字符串的wire_type 是2，代表值是可变的，长度会被编码进字节流里面。
+
+如下例子：
+
+message Test2 {
+  optional string b = 2;
+}
+将b 赋值为"testing" ，得到下面的结果
+
+12 07 [74 65 73 74 69 6e 67]
+key 是0x12，最后三位代表wire_type 结果为2（length-delimited），key 为2
+[]里面的内容是UTF8 的 "testing"
+0x12
+→ 0001 0010  (binary representation)
+→ 00010 010  (regroup bits)
+→ field_number = 2, wire_type = 2
+长度是07，代表后面的7个字节为字符串内容
+复合结构消息
+message Test1 {
+  optional int32 a = 1;
+}
+message Test3 {
+  optional Test1 c = 3;
+}
+Test1's a 字段依然是150:
+
+ 1a 03 08 96 01
+后面08 96 01就不说了，前面解析过了
+1a 二进制为00011010，后三位代表wire_type 为2，前面代表key 为数字3。所以Test1结果被当作字符串对待了
+03 为长度，代表Test3里面内容长度为3 个字节
+
+
+Optional And Repeated
+在proto2 里面，消息字段定义为repeated没有在后面加选项packed=true，编码的消息可能有零个或者多个key-value 键值对，这些键值对也不是连续的，可能中间插入了其他字段，意思是和其他字段交替出现。
+任何不是repeated字段在proto3 里面或者optional 字段在proto2，编码消息可能有也可能没有那个字段形成的key value键值对。
+通常编码消息对于不是repeated字段永远不可能出现超过1个的键值对，解析器期望去处理这种情况。对于数字类型和字符串类型，如果同一个字段出现多次，解析器会使用最后看见的一个值。对于复合类型字段，解析器合并多个实例到同一个字段，就像Message::MergeFrom方法一样。同个嵌套类型，如果出现了多个键值对，解析器会采取合并策略。
+MyMessage message;
+message.ParseFromString(str1 + str2);
+和下面的结果是一样的
+
+MyMessage message, message2;
+message.ParseFromString(str1);
+message2.ParseFromString(str2);
+message.MergeFrom(message2);
+
+
+Packed Repeated Fields
+proto2 介绍了packed repeated字段，在repeated fields后使用选项[packed=true]
+proto3默认使用packed编码repeated数字字段
+这些函数类似于重复字段，但是编码方式不同，包含零元素的压缩重复字段不会出现在编码消息中，要不然，该字段的所有元素会打包到wire_type 为2 的键值对中。每个元素的编码方式于正常情况相同，只是前面没有键
+例如下面的类型
+
+message Test4 {
+  repeated int32 d = 4 [packed=true];
+}
+Test4 的repeated 有三个值，3、270、86942 。编码结果将会如下面所示
+
+22        // key (field number 4, wire type 2)
+06        // payload size (6 bytes)
+03        // first element (varint 3)
+8E 02     // second element (varint 270)
+9E A7 05  // third element (varint 86942)
+只有varint, 32-bit, or 64-bit wire types可以使用packed
+虽然通常情况下没有必要为编码repeated字段使用多个键值对，但是解析器也必须做这样的编码，每对包含完整的信息。
+Protocol buffer必须能解析编译为packed的字段跟没有使用packed一样。在兼容性上就可以向前向后兼容使用[packed=true]
+Field Order
+字段数字顺序可以任何顺序出现在proto里面。顺序对消息序列化没有任何影响。
+
+当消息被序列化时，是无法保证已知字段和未知字段被写入，序列化是一个实现细节，任何特定实现的细节在将来都会被改变，因此protocol buffer 必须能够解析字段在任何顺序。
+
+syntax = "proto3";
+option go_package = "protos/pbs";
+
+//玩家资源
+message Res1 {
+  //金条
+  int64 Gold  =1;
+  //钞票
+  int64 Money =2;
+}
+message Role1 {
+  //资源
+  Res1 Res=6;
+  //属性
+  map<int64,int64> Attr=3;
+  //id
+  int64  Id =1;
+
+
+  //是不是vip
+  bool IsVip =5;
+  //姓名
+  string Name=2;
+
+}
+字段顺序对结果并没有任何影响，但是这样写做好被领导怼的准备吧(*￣︶￣)
+
