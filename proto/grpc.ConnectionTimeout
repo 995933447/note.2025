@@ -1,0 +1,58 @@
+这段代码是使用 Go 创建一个 gRPC 服务器时，设置了一个 连接超时时间：
+
+go
+复制
+编辑
+s := grpc.NewServer(
+	grpc.ConnectionTimeout(3*time.Second),
+)
+✅ 含义详解：
+grpc.NewServer(...)
+创建一个新的 gRPC 服务端实例。
+
+grpc.ConnectionTimeout(3*time.Second)
+这是一个 Server 端选项，表示：
+
+如果客户端与服务端之间的 HTTP/2 连接建立过程中（例如 TLS 握手、ALPN 协议协商）超过了 3 秒还没完成，那么服务端会关闭这个连接。
+
+⚠️ 注意事项：
+这个超时时间不影响已建立连接上的 RPC 调用。
+
+它仅在服务端用于 初始连接建立期间，主要是为了防止资源被慢连接耗尽。
+
+对于使用 grpc.Dial() 的客户端，这个选项不会生效（那是客户端配置）。
+
+🧠 实际应用场景：
+防御恶意客户端或网络异常时卡住连接握手阶段。
+
+限制客户端连接建立必须在一定时间内完成。
+
+✅ 举个完整例子：
+go
+复制
+编辑
+package main
+
+import (
+	"log"
+	"net"
+	"time"
+
+	"google.golang.org/grpc"
+)
+
+func main() {
+	lis, err := net.Listen("tcp", ":50051")
+	if err != nil {
+		log.Fatalf("监听失败: %v", err)
+	}
+
+	server := grpc.NewServer(
+		grpc.ConnectionTimeout(3*time.Second),
+	)
+
+	log.Println("gRPC 服务器启动于 :50051")
+	if err := server.Serve(lis); err != nil {
+		log.Fatalf("启动失败: %v", err)
+	}
+}
