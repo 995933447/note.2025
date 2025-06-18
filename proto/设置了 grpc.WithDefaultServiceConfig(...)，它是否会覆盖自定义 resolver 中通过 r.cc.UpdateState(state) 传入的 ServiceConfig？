@@ -1,0 +1,72 @@
+简短结论：
+不会覆盖。
+
+grpc.WithDefaultServiceConfig(...) 只作为“兜底配置”，当解析器没有提供 ServiceConfig 时才会使用。
+
+🧠 深入解释：
+gRPC 的服务配置 (ServiceConfig) 来源有两个渠道：
+
+1. 解析器（resolver）动态提供的配置
+由你在自定义 resolver.Resolver 中通过：
+
+go
+复制
+编辑
+r.cc.UpdateState(resolver.State{
+    Addresses:     []resolver.Address{...},
+    ServiceConfig: parsedConfig,
+})
+主动推送给 gRPC 的客户端连接。
+
+✅ 优先级更高。
+
+2. Dial 时设置的默认配置
+go
+复制
+编辑
+grpc.WithDefaultServiceConfig(`{"loadBalancingPolicy":"round_robin"}`)
+这是一个 默认值，当 resolver 没有提供配置 时，gRPC 会使用它。
+
+🎯 优先级逻辑如下（官方行为）：
+来源	是否覆盖	说明
+resolver.State.ServiceConfig	✅ 优先使用	动态服务端配置，更具权威性
+grpc.WithDefaultServiceConfig(...)	仅当 resolver 未提供配置时生效	fallback 行为
+
+✅ 示例行为对比：
+✅ 情况 1：resolver 提供 ServiceConfig
+go
+复制
+编辑
+r.cc.UpdateState(resolver.State{
+    Addresses: []resolver.Address{...},
+    ServiceConfig: internalparsedSC, // from json
+})
+👉 忽略 WithDefaultServiceConfig(...)，使用 resolver 的配置。
+
+✅ 情况 2：resolver 不提供 ServiceConfig
+go
+复制
+编辑
+r.cc.UpdateState(resolver.State{
+    Addresses: []resolver.Address{...},
+    // 没有 ServiceConfig
+})
+👉 使用你在 Dial 中传入的默认值，例如 round_robin。
+
+🧪 验证方法
+你可以通过 grpc.WithDisableServiceConfig() 关闭所有 ServiceConfig，然后观察是否负载均衡器还会生效，来确认你传入的配置是 fallback 而非覆盖：
+
+go
+复制
+编辑
+grpc.Dial(
+  "example:cluster@callee",
+  grpc.WithTransportCredentials(insecure.NewCredentials()),
+  grpc.WithDisableServiceConfig(),
+)
+如果此时 round_robin 不再生效，就说明你原本依赖的是 resolver 的配置。
+
+✅ 总结
+问题	答案
+grpc.WithDefaultServiceConfig() 会不会覆盖 r.cc.UpdateState() 的 ServiceConfig？	❌ 不会。只有在解析器没提供配置时才会生效。
+谁优先级更高？	✅ Resolver 的 UpdateState 配置优先级更高
