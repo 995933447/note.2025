@@ -1,0 +1,446 @@
+本篇为【写给go开发者的gRPC教程】系列第九篇
+第一篇：protobuf基础
+第二篇：通信模式
+第三篇：拦截器
+第四篇：错误处理
+第五篇：metadata
+第六篇：超时控制
+第七篇：安全
+第八篇：用户认证
+第九篇：服务发现与负载均衡 👈
+本系列将持续更新，欢迎关注 👏 获取实时通知
+
+对于一个客户端创建请求的过程
+go 体验AI代码助手 代码解读复制代码conn, err := grpc.Dial("example:8009", grpc.WithInsecure())
+if err != nil {
+  panic(err)
+}
+
+
+gRPC客户端通过服务发现解析请求，将名称解析为一个或多个IP地址，以及服务配置
+客户端使用上一步的服务配置、ip列表、实例化负载均衡策略
+负载均衡策略为每个服务器地址创建一个子通道（channel），并监测每一个子通道状态
+当有rpc请求时，负载均衡策略决定那个子通道即gRPC服务器将接收请求，当可用服务器为空时客户端的请求将被阻塞
+
+gRPC官方提供了基本的服务发现和负载均衡逻辑，并提供了接口供扩展用于开发自定义的服务发现与负载均衡
+服务发现
+用通俗易懂的方式来解释下什么是服务发现。通常情况下客户端需要知道服务端的IP+端口号才能建立连接，但服务端的IP和端口号并不是那么容易记忆。还有更重要的，在云部署的环境中，服务端的IP和端口可能随时会发生变化。
+所以我们可以给某一个服务起一个名字，客户端通过名字创建与服务端的连接，客户端底层使用服务发现系统，解析这个名字来获取真正的IP和端口，并在服务端的IP和端口发生变化时，重新建立连接。这样的系统通常也会被叫做name-system（名字服务）
+gRPC 中的默认name-system是 DNS，同时在客户端以插件形式提供了自定义name-system的机制。
+名字格式
+gRPC采用的名字格式遵循的RFC 3986中定义的URI语法
+ini 体验AI代码助手 代码解读复制代码scheme:[//[user[:password]@]host[:port]][/path][?query][#fragment]
+
+例如
+
+gRPC关注其中两部分
+
+
+URI scheme：第一个:前面的标识。对于gRPC客户端来说，它指示要使用的服务发现解析器，如果未指定前缀或方案未知，则默认使用DNS方案
+
+
+URI path： 指示要解析的名字
+
+
+大部分gRPC实现默认支持以下的URI schemes
+
+
+dns:[//authority/]host[:port] -- DNS (default)
+
+
+unix:path, unix://absolute_path -- Unix domain sockets (Unix systems only)
+
+
+unix-abstract:abstract_path -- Unix domain socket in abstract namespace (Unix systems only)
+
+
+服务的服务注册
+如果gRPC服务端的地址是静态的，可以在客户端服务发现时直接解析为静态的地址
+如果gRPC服务端的地址是动态的，可以有两种选择
+
+自注册：当gRPC的服务启动后，向一个集中的注册中心进行注册
+平台的服务发现：使用k8s平台时，平台会感知gPRC实例的变化
+
+关于服务注册这里不在做更多介绍了
+客户端的服务发现
+自定义服务发现需要在客户端启动前，注册一个服务解析器（Resolve）
+Golang中使用google.golang.org/grpc/resolver.Register(resolver.Builder)注册，这个函数不是直接接收一个解析器，而是使用工厂模式接收一个解析器的构造器
+go 体验AI代码助手 代码解读复制代码type Builder interface {
+	// Build creates a new resolver for the given target.
+	//
+	// gRPC dial calls Build synchronously, and fails if the returned error is
+	// not nil.
+	Build(target Target, cc ClientConn, opts BuildOptions) (Resolver, error)
+	// Scheme returns the scheme supported by this resolver.
+	// Scheme is defined at https://github.com/grpc/grpc/blob/master/doc/naming.md.
+	Scheme() string
+}
+
+✨ Scheme()需要返回的就是名字格式中提到的URI scheme
+✨ Build(...)需要返回一个服务发现解析器google.golang.org/grpc/resolver.Resolver
+✨✨cc ClientConn代表客户端与服务端的连接，其拥有的cc.UpdateState(State) error可以让我们更新链接的状态
+go 体验AI代码助手 代码解读复制代码type Resolver interface {
+	// ResolveNow will be called by gRPC to try to resolve the target name
+	// again. It's just a hint, resolver can ignore this if it's not necessary.
+	//
+	// It could be called multiple times concurrently.
+  // ResolveNow 尝试再一次对域名进行解析，在个人实践中，服务端进程挂掉会触发该调用
+	ResolveNow(ResolveNowOptions)
+  // Close closes the resolver.
+  // 资源释放。
+	Close()
+}
+
+解析器需要有能力从注册中心获取解析结果，并更新客户端中连接(cc ClientConn)的信息。还可以持续watch一个名字的解析结果，实时的更新客户端中连接的信息
+
+解析出来的地址列表（包含ip和port）
+针对连接的服务配置，如负载均衡等，来想覆盖全局的负责均衡配置
+每一个地址可以包含一系列的属性（kv），他们可以用来支持后续的负载均衡策略
+
+示例代码
+gRPC resolver 原理
+🌲 在 init() 阶段时
+
+创建并注册Builder 实例，将其注册到 grpc 内部的 resolveBuilder 表中（其实是一个全局 map，key 为协议名；value 为构造的 resolveBuilder）
+
+🌲 客户端启动时通过自定义Dail()方法构造grpc.ClientConn单例
+
+
+grpc.DialContext() 方法内部解析 URI，分析协议类型，并从 resolveBuilder 表中查找协议对应的 resolverBuilder
+
+
+将地址作为 Target 、conn单例作为resolver.ClientConn参数调用 resolver.Build 方法实例化出 Resolver
+
+
+用户 Resolver实现中调用 cc.UpdateState 传入 State.Addresses 地址，gRPC使用这个地址建立连接，传入State.ServiceConfig，gRPC使用这份服务配置覆盖默认配置
+
+
+
+代码
+go 体验AI代码助手 代码解读复制代码# builder.go
+package resolver
+
+import "google.golang.org/grpc/resolver"
+
+var _ resolver.Builder = Builder{}
+
+type Builder struct {
+	addrsStore map[string][]string
+}
+
+func NewResolverBuilder(addrsStore map[string][]string) *Builder {
+	return &Builder{addrsStore: addrsStore}
+}
+
+func (b Builder) Build(target resolver.Target, cc resolver.ClientConn, opts resolver.BuildOptions) (resolver.Resolver, error) {
+	r := &Resolver{
+		target:     target,
+		cc:         cc,
+		addrsStore: b.addrsStore,
+	}
+	r.Start()
+	return r, nil
+}
+
+func (b Builder) Scheme() string {
+	return "example"
+}
+
+go 体验AI代码助手 代码解读复制代码# resolver.go
+package resolver
+
+import (
+	"google.golang.org/grpc/resolver"
+)
+
+var _ resolver.Resolver = &Resolver{}
+
+// impl google.golang.org/grpc/resolver.Resolver
+type Resolver struct {
+	target resolver.Target
+	cc     resolver.ClientConn
+
+	addrsStore map[string][]string
+}
+
+func (r *Resolver) Start() {
+	// 在静态路由表中查询此 Endpoint 对应 addrs
+	var addrs []resolver.Address
+	for _, addr := range r.addrsStore[r.target.URL.Opaque] {
+		addrs = append(addrs, resolver.Address{Addr: addr})
+	}
+
+	r.cc.UpdateState(resolver.State{
+		Addresses: addrs,
+    // 设置负载均衡策略为round_robin
+		ServiceConfig: r.cc.ParseServiceConfig(
+    `{"loadBalancingPolicy":"round_robin"}`),
+	})
+}
+
+func (r *Resolver) ResolveNow(resolver.ResolveNowOptions) {
+
+}
+
+func (r *Resolver) Close() {
+
+}
+
+go 体验AI代码助手 代码解读复制代码# main.go
+package main
+
+import (
+	"context"
+	"log"
+
+	rs "github.com/liangwt/note/grpc/name_resolver_lb_example/client/resolver"
+	pb "github.com/liangwt/note/grpc/name_resolver_lb_example/ecommerce"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/resolver"
+)
+
+func main() {
+	resolver.Register(rs.NewResolverBuilder(map[string][]string{
+		"cluster@callee": {
+			"127.0.0.1:8009",
+		},
+	}))
+
+	conn, err := grpc.Dial("example:cluster@callee", grpc.WithInsecure())
+	if err != nil {
+		panic(err)
+	}
+  
+	// ...
+}
+
+负载均衡
+同样来通俗易懂的解释下什么负载均衡。为了提高系统的负载能力和稳定性，我们的服务端往往具有多台服务器，负载均衡的目的就是希望请求能分散到不同的服务器，从服务器列表中选择一台服务器的算法就是负载均衡的策略，常见的轮循、加权轮询等
+负载均衡器要在多台服务器之间选择，所以通常情况下负载均衡器是具备服务发现的能力的
+根据负载均衡实现所在的位置不同，通常可分为以下三种解决方案：
+1、集中式负载均衡（Proxy Model）
+在客户端和服务端之间有一个独立的LB，通常是专门的硬件设备如 F5，或者基于软件如 LVS，HAproxy，Nginx等实现。LB使用负载均衡策略将请求转发到目标服务
+因为所有服务调用流量都经过LB，当服务数量和调用量大的时候，LB容易成为瓶颈；一旦LB发生故障影响整个系统；客户端、服务端之间增加了一级，有一定性能开销
+
+2、客户端负载均衡（Balancing-aware Client）
+客户端负载将LB的功能集成到客户端进程里，然后使用负载均衡策略选择一个目标服务地址，向目标服务发起请求。LB能力被分散到每一个服务消费者的进程内部，同时服务消费方和服务提供方之间是直接调用，没有额外开销，性能比较好。
+但如果有多种不同的语言栈，就要配合开发多种不同的客户端，有一定的研发和维护成本；后续如果要对客户库进行升级，势必要求服务调用方修改代码并重新发布，升级较复杂。
+
+3、独立负载均衡进程（External Load Balancing Service）
+将LB从进程内移出来，变成主机上的一个独立进程。主机上的一个或者多个服务要访问目标服务时，他们都通过同一主机上的独立LB进程做负载均衡
+此方案有两种模式
+第一种是直接由LB进行转发请求，被称为sidecar方案
+第二种是从LB获取到IP后依旧由客户端发起请求，gRPC曾经支持过此方案叫lookaside方案，目前已废弃
+该方案也是一种分布式方案没有单点问题，一个LB进程挂了只影响该主机上的客户端；客户端和LB之间是本地调用调用性能好；同时该方案还简化了客户端，不需要为不同语言开发客户库，LB的升级不需要服务调用方改代码。 该方案主要问题：部署较复杂，环节多，出错调试排查问题不方便
+
+gRPC的负载均衡
+上文介绍的三种负载均衡方式，集中式负载均衡和gRPC无关，属于外部的基础设施，因此我们不再介绍
+gRPC中的负载平衡是以每次调用为基础，而不是以每个连接为基础。换句话说，即使所有的请求都来自一个客户端，它仍能在所有的服务器上实现负载平衡
+gRPC目前内置四种策略
+🌲 pick_first：默认策略，选择第一个
+🌲 round_robin：轮询
+使用默认的负载均衡器很简单，只需要在建立连接的时候指定负载均衡策略即可。
+
+⚠️ 注意
+旧版本gRPC使用 grpc.WithBalancerName("round_robin"),已经被废弃，使用grpc.WithDefaultServiceConfig。
+grpc.WithDefaultServiceConfig可以被上文服务发现中提到的cc.UpdateState(State) error覆盖配置
+
+go 体验AI代码助手 代码解读复制代码	conn, err := grpc.Dial("example:cluster@callee",
+		grpc.WithInsecure(),
+		grpc.WithDefaultServiceConfig(
+			`{"loadBalancingPolicy":"round_robin"}`,
+		),
+	)
+
+🌲 grpclb：已废弃
+它属于上文介绍的负载均衡中独立负载均衡进程第二种。不必直接在客户端中添加新的LB策略，而只实现诸如round-robin之类的简单算法，任何更复杂的算法都将由lookaside负载平衡器提供
+
+🌲 xDS
+如果接触过servicemesh那么对xDS并不会陌生，xDS 本身是Envoy中的概念，现在已经发展为用于配置各种数据平面软件的标准，最新版本的gRPC已经支持xDS。不同于单纯的负载均衡策略，xDS在gRPC包含了服务发现和负载均衡的概念
+这里简单的理解下xDS，本质上xDS就是一个标准的协议
+它规定了xDS客户端和xDS服务端的交互流程，即API调用的顺序
+我们在xDS server实现服务发现，配置负载均衡策略等等，支持xDS的客户端连接到xDS server并通过xDS api来获取各种需要的数据和配置
+xDS主要应用于servicemesh中，在mesh中由sidecar连接到xDS server进行数据交互，同时由sidecar来控制流量的分发。也就是上文提到的独立负载均衡进程的第一种模式
+
+gRPC使用xDS是一种无proxy的客户端负载均衡方案。对比Mesh方案，性能更好。我们把servicemesh的负载均衡和grpc的xds负载均衡放在一起感受下区别
+
+📖 这意味着，grpclb废弃后，gRPC内置的pick_first、round_robin、xDS三种模式都属于客户端的负载均衡模式。pick_first、round_robin是单纯的负载均衡策略；xDS包含了服务发现等一系列能力，并且还在不断拓展中，而我们控制gRPC的行为也被转移到了xDS server上了。
+xDS模式的使用
+xDS内容较多，又比较新，单独开个章节介绍下xDS的使用
+gRPC xDS架构中出现了三个服务
+
+xDS server：它是我们的控制面
+gRPC client：它既是gRPC服务的客户端，同时也是xDS的客户端
+gRPC server：它是gRPC服务的服务端，它需要具备被xDS server发现的能力
+
+我们可以使用 Envoy go-control-plane库来实现xDS server，这部分的开发类似于servicemesh，就不介绍太多了，如果位于k8s平台内可以参考下istio中控制面的实现
+gRPC server需要自注册或者托管到k8s平台，如果托管到k8s则可以继续参考istio中控制面的实现
+因为xDS也包含了服务发现的部分，因此对于client来说第一步需要先开发自定义的服务发现和负载均衡配置。幸运的是gRPC官方已经为我们开发了对应实现，只需要引入包即可，在init阶段会注册xDS的解析器和负载均衡器
+go 体验AI代码助手 代码解读复制代码_ "google.golang.org/grpc/xds" // To install the xds resolvers and balancers.
+
+随后只需要把gRPC client连接到xDs server即可，这部分与非xDS并无不同。只是目标服务的地址的URI scheme为xds
+go 体验AI代码助手 代码解读复制代码conn, err := grpc.Dial("xds:///localhost:50051", grpc.WithTransportCredentials(creds))
+if err != nil {
+  panic(err)
+}
+
+ctx, cancelFn := context.WithCancel(context.Background())
+defer cancelFn()
+
+c := pb.NewOrderManagementClient(conn)
+res, err := c.AddOrder(ctx, &order)
+
+完整代码可以参考：github.com/grpc/grpc-g…
+自定义负载均衡器
+自定义负载均衡器需要使用google.golang.org/grpc/balancer.Register提前注册，此函数和服务发现一样接受工厂函数
+go 体验AI代码助手 代码解读复制代码// Builder creates a balancer.
+type Builder interface {
+	// Build creates a new balancer with the ClientConn.
+	Build(cc ClientConn, opts BuildOptions) Balancer
+	// Name returns the name of balancers built by this builder.
+	// It will be used to pick balancers (for example in service config).
+	Name() string
+}
+
+✨ Name()是负载均衡策略的名字
+✨ Build(...)需要返回负载均衡器
+✨✨ cc ClientConn代表客户端与服务端的连接，其拥有一系列函数可以让我们更新链接的状态
+go 体验AI代码助手 代码解读复制代码type Balancer interface {
+	// UpdateClientConnState is called by gRPC when the state of the ClientConn
+	// changes.  If the error returned is ErrBadResolverState, the ClientConn
+	// will begin calling ResolveNow on the active name resolver with
+	// exponential backoff until a subsequent call to UpdateClientConnState
+	// returns a nil error.  Any other errors are currently ignored.
+	UpdateClientConnState(ClientConnState) error
+	// ResolverError is called by gRPC when the name resolver reports an error.
+	ResolverError(error)
+	// UpdateSubConnState is called by gRPC when the state of a SubConn
+	// changes.
+	UpdateSubConnState(SubConn, SubConnState)
+	// Close closes the balancer. The balancer is not required to call
+	// ClientConn.RemoveSubConn for its existing SubConns.
+	Close()
+}
+
+负载均衡器需要实现一系列的函数用于gRPC在不同场景下调用
+类RR算法负载均衡器
+如果要实现一个类round_robin的负载均衡策略，gRPC官方实现提供了一个baseBuilder，它已经实现了大部Balancer接口，可以大幅简化了我们创建RR策略的逻辑。使用google.golang.org/grpc/balancer/base.NewBalancerBuilder创建负载均衡的工厂
+go 体验AI代码助手 代码解读复制代码func NewBalancerBuilder(name string, pb PickerBuilder, config Config) balancer.Builder 
+
+
+name string负载均衡器的名字
+pb PickerBuilder是我们要实现的负载均衡策略逻辑的地方
+config Config可以配置是否要进行健康检查
+
+go 体验AI代码助手 代码解读复制代码// PickerBuilder creates balancer.Picker.
+type PickerBuilder interface {
+	// Build returns a picker that will be used by gRPC to pick a SubConn.
+	Build(info PickerBuildInfo) balancer.Picker
+}
+
+go 体验AI代码助手 代码解读复制代码type Picker interface {
+  // 子连接选择
+	Pick(info PickInfo) (PickResult, error)
+}
+
+于是借助base.NewBalancerBuilder我们仅需要实现Picker一个函数即可实现类RR的负载均衡策略了
+代码
+利用Picker接口来实现一个随机选择策略
+go 体验AI代码助手 代码解读复制代码# builder.go
+package balancer
+
+import (
+	"google.golang.org/grpc/balancer"
+	"google.golang.org/grpc/balancer/base"
+)
+
+var _ base.PickerBuilder = &Builder{}
+
+type Builder struct {
+}
+
+func NewBalancerBuilder() balancer.Builder {
+	return base.NewBalancerBuilder("random_picker", &Builder{}, base.Config{HealthCheck: true})
+}
+
+func (b *Builder) Build(info base.PickerBuildInfo) balancer.Picker {
+	if len(info.ReadySCs) == 0 {
+		return base.NewErrPicker(balancer.ErrNoSubConnAvailable)
+	}
+
+	var scs []balancer.SubConn
+	for subConn := range info.ReadySCs {
+		scs = append(scs, subConn)
+	}
+
+	return &Picker{
+		subConns: scs,
+	}
+}
+
+go 体验AI代码助手 代码解读复制代码// picker.go
+package balancer
+
+import (
+	"math/rand"
+
+	"google.golang.org/grpc/balancer"
+)
+
+var _ balancer.Picker = &Picker{}
+
+type Picker struct {
+	subConns []balancer.SubConn
+}
+
+func (p *Picker) Pick(info balancer.PickInfo) (balancer.PickResult, error) {
+	index := rand.Intn(len(p.subConns))
+	sc := p.subConns[index]
+	return balancer.PickResult{SubConn: sc}, nil
+}
+
+go 体验AI代码助手 代码解读复制代码#client.go
+package main
+
+import (
+	"context"
+	"log"
+
+	bl "github.com/liangwt/note/grpc/name_resolver_lb_example/client/balancer"
+	rs "github.com/liangwt/note/grpc/name_resolver_lb_example/client/resolver"
+	pb "github.com/liangwt/note/grpc/name_resolver_lb_example/ecommerce"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/balancer"
+	"google.golang.org/grpc/resolver"
+)
+
+func main() {
+	resolver.Register(rs.NewResolverBuilder(map[string][]string{
+		"cluster@callee": {
+			"127.0.0.1:8009",
+			"127.0.0.1:8010",
+		},
+	}))
+
+	balancer.Register(bl.NewBalancerBuilder())
+
+	conn, err := grpc.Dial("example:cluster@callee",
+		grpc.WithInsecure(),
+		grpc.WithDefaultServiceConfig(
+			`{"loadBalancingPolicy":"random_picker"}`,
+		),
+	)
+	if err != nil {
+		panic(err)
+	}
+	
+  ....
+}
+
+
+
+
+作者：凉凉的知识库
+链接：https://juejin.cn/post/7251231773673406520
+来源：稀土掘金
+著作权归作者所有。商业转载请联系作者获得授权，非商业转载请注明出处。
