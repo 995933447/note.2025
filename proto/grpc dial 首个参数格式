@@ -1,0 +1,54 @@
+在 Go 的 gRPC 中，grpc.Dial() 的第一个参数（即目标地址）格式取决于你是否使用了 名称解析（resolver） 和 负载均衡器（balancer）。
+
+✅ 标准格式总结：
+使用方式	地址格式	示例
+普通直连（最常见）	host:port	"localhost:50051"
+带 scheme 的解析器地址（支持自定义 resolver）	scheme:///target	"dns:///localhost:50051"
+错误格式（❌）	scheme:target	"dns:localhost:50051" ← 错误
+
+🎯 正确格式：scheme:///target
+这个是 gRPC 官方要求的标准格式，适用于使用名称解析器的场景（例如 dns、etcd、consul 等）：
+
+✅ 示例：
+go
+复制
+编辑
+conn, err := grpc.Dial("dns:///my-service.default.svc.cluster.local:50051", grpc.WithTransportCredentials(...))
+dns: 解析 scheme
+
+///: 固定写法，gRPC 的 URI 语法要求的分隔符
+
+my-service...: 你要解析的服务地址
+
+❓为什么要用 :/// 而不是 :？
+dns:localhost:50051 会被 gRPC 解析成：
+
+scheme: dns
+
+authority: localhost
+
+endpoint: 50051
+→ 会导致解析器行为异常（解析不到正确的目标）。
+
+只有 dns:///localhost:50051 才会把整个 "localhost:50051" 传给 dns 解析器。
+
+✅ 简单记忆法：
+直连用 "host:port" → 不需要 scheme
+
+用 resolver（比如 dns、etcd）时 → 一定要 "scheme:///name"
+
+🎁 Bonus：使用自定义负载均衡器或服务发现时
+你可能会看到像这样的：
+
+go
+复制
+编辑
+grpc.Dial("consul:///my-service", ...)
+只要你注册了对应的 resolver 插件，这种 URI 就是有效的。
+
+✅ 小结
+grpc.Dial("dns:///your-service:port") ← ✅ 正确
+
+grpc.Dial("dns:your-service:port") ← ❌ 错误
+
+grpc.Dial("localhost:50051") ← ✅ 直连，无需 scheme
