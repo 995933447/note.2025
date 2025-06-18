@@ -1,0 +1,181 @@
+本篇为【写给go开发者的gRPC教程系列】第六篇
+第一篇：protobuf基础
+第二篇：通信模式
+第三篇：拦截器
+第四篇：错误处理
+第五篇：metadata
+第六篇：超时控制 👈
+本系列将持续更新，欢迎关注👏获取实时通知
+
+
+导言
+一个合理的超时时间是非常必要的，它能提高用户体验，提高服务器的整体性能，是服务治理的常见手段之一
+
+为什么要设置超时
+用户体验：很多RPC都是由用户侧发起，如果请求不设置超时时间或者超时时间不合理，会导致用户一直处于白屏或者请求中的状态，影响用户的体验
+资源利用：一个RPC会占用两端（服务端与客户端）端口、cpu、内存等一系列的资源，不合理的超时时间会导致RPC占用的资源迟迟不能被释放，因而影响服务器稳定性
+综上，一个合理的超时时间是非常必要的。在一些要求更高的服务中，我们还需要针对DNS解析、连接建立，读、写等设置更精细的超时时间。除了设置静态的超时时间，根据当前系统状态、服务链路等设置自适应的动态超时时间也是服务治理中一个常见的方案。
+客户端的超时
+连接超时
+还记得我们怎么在客户端创建连接的么？
+go 体验AI代码助手 代码解读复制代码conn, err := grpc.Dial("127.0.0.1:8009",
+    grpc.WithInsecure(),
+)
+if err != nil {
+    panic(err)
+}
+
+// c := pb.NewOrderManagementClient(conn)
+
+// // Add Order
+// order := pb.Order{
+// 	Id:          "101",
+// 	Items:       []string{"iPhone XS", "Mac Book Pro"},
+// 	Destination: "San Jose, CA",
+// 	Price:       2300.00,
+// }
+// res, err := c.AddOrder(context.Background(), &order)
+// if err != nil {
+// 	panic(err)
+// }
+
+如果目标地址127.0.0.1:8009无法建立连接，grpc.Dial()会返回错误么？这里直接放结论：不会的，grpc默认会异步创建连接，并不会阻塞在这里，如果连接没有创建成功会在下面的RPC调用中报错。
+如果我们想控制连接创建时的超时时间该怎么做呢？
+
+异步转成同步：首先我们需要使用grpc.WithBlock()这个选项让连接的创建变为阻塞式的
+超时时间：使用grpc.DialContext()以及Go中context.Context来控制超时时间
+
+于是实现如下，当然使用context.WithDeadline()效果也是一样的。连接如果在3s内没有创建成功，则会返回context.DeadlineExceeded错误
+go 体验AI代码助手 代码解读复制代码ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+defer cancel()
+
+conn, err := grpc.DialContext(ctx, "127.0.0.1:8009",
+	grpc.WithInsecure(),
+	grpc.WithBlock(),
+)
+if err != nil {
+	if err == context.DeadlineExceeded {
+        panic(err)
+    }
+    panic(err)
+}
+
+服务调用的超时
+和上面连接超时的配置类似。无论是普通RPC还是流式RPC，服务调用的第一个参数均是context.Context
+所以可以使用context.Context来控制服务调用的超时时间，然后使用status来判断是否是超时报错，关于status可以回顾之前讲过的错误处理
+go 体验AI代码助手 代码解读复制代码ctx, cancel = context.WithTimeout(context.Background(), 3*time.Second)
+defer cancel()
+
+// Add Order
+order := pb.Order{
+	Id:          "101",
+	Items:       []string{"iPhone XS", "Mac Book Pro"},
+	Destination: "San Jose, CA",
+	Price:       2300.00,
+}
+res, err := c.AddOrder(ctx, &order)
+if err != nil {
+	st, ok := status.FromError(err)
+	if ok && st.Code() == codes.DeadlineExceeded {
+		panic(err)
+	}
+	panic(err)
+}
+
+拦截器中的超时
+普通RPC还是流式RPC拦截器函数签名第一个参数也是context.Context，我们也可以在拦截器中修改超时时间。错误处理也是和服务调用是一样的
+需要注意的是context.WithTimeout(context.Background(), 100*time.Second)。因为Go中context.Context向下传导的效果，我们需要基于context.Background()创建新的context.Context，而不是基于入参的ctx，
+go 体验AI代码助手 代码解读复制代码func unaryClientInterceptor(ctx context.Context, method string, req, reply interface{},
+	cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Second)
+	defer cancel()
+
+	// Invoking the remote method
+	err := invoker(ctx, method, req, reply, cc, opts...)
+    if err != nil {
+        st, ok := status.FromError(err)
+        if ok && st.Code() == codes.DeadlineExceeded {
+            panic(err)
+        }
+        panic(err)
+    }
+
+	return err
+}
+
+服务端的超时
+连接超时
+服务端也可以控制连接创建的超时时间，如果没有在设定的时间内建立连接，服务端就会主动断连，避免浪费服务端的端口、内存等资源
+go 体验AI代码助手 代码解读复制代码s := grpc.NewServer(
+	grpc.ConnectionTimeout(3*time.Second),
+)
+
+服务实现中的超时
+服务实现函数的第一个参数也是context.Context，所以我们可以在一些耗时操作前对context.Context进行判断：如果已经超时了，就没必要继续往下执行了。此时客户端也会收到上文提到过的超时error。
+go 体验AI代码助手 代码解读复制代码func (s *server) AddOrder(ctx context.Context, orderReq *pb.Order) (*wrapperspb.StringValue, error) {
+	log.Printf("Order Added. ID : %v", orderReq.Id)
+
+	select {
+	case <-ctx.Done():
+		return nil, status.Errorf(codes.Canceled, "Client cancelled, abandoning.")
+	default:
+	}
+
+	orders[orderReq.Id] = *orderReq
+
+	return &wrapperspb.StringValue{Value: "Order Added: " + orderReq.Id}, nil
+}
+
+很多库都支持类似的操作，我们要做的就是把context.Context透传下去，当context.Context超时时就会提前结束操作了
+go 体验AI代码助手 代码解读复制代码db, err := gorm.Open()
+if err != nil {
+    panic("failed to connect database")
+}
+
+db.WithContext(ctx).Save(&users)
+
+拦截器中的超时
+在服务端的拦截器里也可以修改超时时间
+go 体验AI代码助手 代码解读复制代码func unaryServerInterceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	// Invoking the handler to complete the normal execution of a unary RPC.
+	m, err := handler(ctx, req)
+
+	return m, err
+}
+
+超时传递
+一个正常的请求会涉及到多个服务的调用。从源头开始一个服务端不仅为上游服务提供服务，也作为下游的客户端
+
+如上的链路，如果当请求到达某一服务时，对于服务A来说已经超时了，那么就没有必要继续把请求传递下去了。这样可以最大限度的避免后续服务的资源浪费，提高系统的整体性能。
+grpc-go实现了这一特性，我们要做的就是不断的把context.Context传下去
+go 体验AI代码助手 代码解读复制代码// 服务A
+func main(){
+    ctx, cancel = context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+    
+    client.ServiceB(ctx)
+}
+
+go 体验AI代码助手 代码解读复制代码// 服务B
+func ServiceB(ctx context.Context){
+    client.ServiceC(ctx)
+}
+
+go 体验AI代码助手 代码解读复制代码// 服务C
+func ServiceC(ctx context.Context){
+    client.ServiceD(ctx)
+}
+
+在每一次的context.Context透传中， timeout都会减去在本进程中耗时，导致这个 timeout 传递到下一个 gRPC 服务端时变短，当在某一个进程中已经超时，请求不会再继续传递，这样即实现了所谓的 超时传递
+关于超时传递的实现可以参考下面的参考资料中的链接
+总结
+通过使用context.Context，我们可以精细化的控制gRPC中服务端、客户端两端的建连，调用，以及在拦截器中的超时时间。同时gRPC还提供了超时传递的能力，让超时的请求不继续在链路中往下传递，提高链路整体的性能。
+
+作者：凉凉的知识库
+链接：https://juejin.cn/post/7208239217943969847
+来源：稀土掘金
+著作权归作者所有。商业转载请联系作者获得授权，非商业转载请注明出处。
