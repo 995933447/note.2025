@@ -1,0 +1,436 @@
+本篇为【写给go开发者的gRPC教程】系列第八篇
+第一篇：protobuf基础
+第二篇：通信模式
+第三篇：拦截器
+第四篇：错误处理
+第五篇：metadata
+第六篇：超时控制
+第七篇：安全
+第八篇：用户认证 👈
+本系列将持续更新，欢迎关注 👏 获取实时通知
+
+gRPC的用户认证
+用户认证，简单来说就是验证请求的用户身份，避免破坏者伪造身份获取他人数据隐私。比如当访问微博网站时，微博服务端通过用户认证来识别你的身份，并返回正确的主页数据
+用户认证有很多方式。例如HTTP中使用的cookie、session、oauth、jwt等等。gRPC框架并不限制用户认证的方式，而是提供了开放的能力来支持各种各样的用户认证
+gRPC的用户认证可以用两句话总结
+
+
+gRPC客户端提供在每一次调用注入用户凭证的能力
+
+
+gRPC服务端使用拦截器来验证每一个客户端的请求
+
+
+要实现在每一次调用注入用户凭证的能力，我们需要实现credentials.PerRPCCredentials接口，并且在客户端创建链接的时候指定grpc.WithPerRPCCredentials(credentials.PerRPCCredentials)
+go 体验AI代码助手 代码解读复制代码type PerRPCCredentials interface {
+	// GetRequestMetadata 获取当前请求的metadata
+	GetRequestMetadata(ctx context.Context, uri ...string) (map[string]string, error)
+	// RequireTransportSecurity 是否使用安全的传输协议
+	RequireTransportSecurity() bool
+}
+
+要验证每一个客户端的请求，我们需要用到前几期提到的拦截器：写给go开发者的gRPC教程-拦截器
+
+下面我们来介绍在gRPC中使用比较常见的两种认证方式：Basic Authentication和JWT
+Basic Authentication
+Basic Authentication是最简单的认证方式
+
+使用Basic Authentication时，客户端携带一个Authorization header头，值为Basic + 空格 + base64编码的用户名:密码
+例如一个用户名和密码都是admin，那么header头如下
+text 体验AI代码助手 代码解读复制代码Authorization: Basic YWRtaW46YWRtaW4=
+
+
+通常并不推荐使用Basic Authentication，gRPC也没有内置组件支持，但在gRPC中很容易做到。
+客户端代码
+我们定义一个结构体BasicAuthentication并让它实现credentials.PerRPCCredentials接口，就可以把用户凭证添加到客户端的上下文中
+go 体验AI代码助手 代码解读复制代码type PerRPCCredentials interface {
+	// GetRequestMetadata 获取当前请求的metadata
+	GetRequestMetadata(ctx context.Context, uri ...string) (map[string]string, error)
+	// RequireTransportSecurity 是否使用安全的传输协议
+	RequireTransportSecurity() bool
+}
+
+go 体验AI代码助手 代码解读复制代码var _ credentials.PerRPCCredentials = BasicAuthentication{}
+
+type BasicAuthentication struct {
+	password string
+	username string
+}
+
+func (b BasicAuthentication) GetRequestMetadata(ctx context.Context, uri ...string) (map[string]string, error) {
+	auth := b.username + ":" + b.password
+	enc := base64.StdEncoding.EncodeToString([]byte(auth))
+
+	return map[string]string{
+		"authorization": "Basic " + enc,
+	}, nil
+}
+
+func (b BasicAuthentication) RequireTransportSecurity() bool {
+	return true
+}
+
+在创建连接时使用grpc.WithPerRPCCredentials(auth)设置每一次请求的用户凭证
+go 体验AI代码助手 代码解读复制代码func main() {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	auth := BasicAuthentication{
+		username: "admin",
+		password: "admin",
+	}
+
+	creds, err := credentials.NewClientTLSFromFile("./x509/rootCa.crt", "www.example.com")
+	if err != nil {
+		panic(err)
+	}
+
+	conn, err := grpc.Dial("localhost:8009",
+		grpc.WithTransportCredentials(creds),
+		grpc.WithPerRPCCredentials(auth))
+	if err != nil {
+		panic(err)
+	}
+	defer conn.Close()
+
+	client := pb.NewOrderManagementClient(conn)
+
+	// Get Order
+	retrievedOrder, err := client.GetOrder(ctx, &wrapperspb.StringValue{Value: "101"})
+	if err != nil {
+		panic(err)
+	}
+
+	log.Print("GetOrder Response -> : ", retrievedOrder)
+}
+
+⚠️ 注意
+go 体验AI代码助手 代码解读复制代码type PerRPCCredentials interface {
+	// GetRequestMetadata 获取当前请求的metadata
+	GetRequestMetadata(ctx context.Context, uri ...string) (map[string]string, error)
+	// RequireTransportSecurity 是否使用安全的传输协议
+	RequireTransportSecurity() bool
+}
+
+RequireTransportSecurity()代表是否使用安全的传输协议。如果设置了true，则必须通过grpc.WithTransportCredentials()设置合理的传输层加密方式，否则会导致建立连接时失败
+gRPC官方库里有个insecure.NewCredentials()，这段函数含义为禁用传输层安全协议，因此grpc.WithTransportCredentials(insecure.NewCredentials())是无效的，依旧会导致建立连接时失败
+go 体验AI代码助手 代码解读复制代码auth := BasicAuthentication{
+    username: "admin",
+    password: "admin",
+}
+
+conn, err := grpc.Dial("localhost:8009",
+                       grpc.WithTransportCredentials(insecure.NewCredentials()),
+                       grpc.WithPerRPCCredentials(auth))
+if err != nil {
+    panic(err)
+}
+
+go 体验AI代码助手 代码解读复制代码$ go run basic-authentication/client/main.go
+panic: grpc: the credentials require transport level security (use grpc.WithTransportCredentials() to set)
+
+服务端代码
+服务端使用拦截器来验证请求是否合法
+对于不合法的token返回codes.Unauthenticated
+如果token合法，在ensureValidBasicCredentials中调用handler来继续请求的处理
+go 体验AI代码助手 代码解读复制代码var (
+	errMissingMetadata = status.Errorf(codes.InvalidArgument, "missing metadata")
+	errInvalidToken    = status.Errorf(codes.Unauthenticated, "invalid credentials")
+)
+
+func ensureValidBasicCredentials(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp interface{}, err error) {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return nil, errMissingMetadata
+	}
+
+	authorization := md["authorization"]
+
+	if len(authorization) < 1 {
+		return nil, errInvalidToken
+	}
+
+	token := strings.TrimPrefix(authorization[0], "Basic ")
+	if token != base64.StdEncoding.EncodeToString([]byte("admin:admin")) {
+		return nil, errInvalidToken
+	}
+
+	return handler(ctx, req)
+}
+
+func main() {
+	l, err := net.Listen("tcp", ":8009")
+	if err != nil {
+		panic(err)
+	}
+
+	creds, err := credentials.NewServerTLSFromFile("./x509/server.crt", "./x509/server.key")
+	s := grpc.NewServer(
+		grpc.UnaryInterceptor(ensureValidBasicCredentials),
+		grpc.Creds(creds),
+	)
+
+	pb.RegisterOrderManagementServer(s, &server{})
+
+	if err := s.Serve(l); err != nil {
+		panic(err)
+	}
+}
+
+JWT
+关于jwt的介绍参考：JSON Web Token 入门教程
+这里简述如下
+
+
+客户端进行登陆操作
+
+
+服务器认证以后，生成一个 JWT 字符串，发回给用户
+JWT 中间用点（.）分隔成三个部分
+tex 体验AI代码助手 代码解读复制代码Header.Payload.Signature
+
+
+
+
+
+
+客户端收到服务器返回的 JWT，可以储存在 Cookie 里面，也可以储存在 localStorage
+
+
+此后，客户端每次与服务器通信，都要带上这个 JWT。你可以把它放在 Cookie 里面自动发送，但是这样不能跨域，所以更好的做法是放在 HTTP 请求的头信息Authorization字段里面
+html 体验AI代码助手 代码解读复制代码Authorization: Bearer <token>
+
+
+
+服务器会校验签名，对这个对象认定用户身份
+
+
+gRPC提供的jwt
+整个gRPC或者说谷歌golang生态提供的jwt包很混乱
+如果不想了解细节直接看结论：不能用golang.org/x/oauth2实现我们常规意义上的jwt功能，虽然这个包里有各式各样的含有jwt字样的函数
+下面是详细梳理
+golang.org/x/oauth2 包含常见平台如谷歌，亚马逊等oauth2的认证功能
+⚠️ golang.org/x/oauth2/go…
+这个包专门提供谷歌api的认证功能，它使用了谷歌的serviceaccount的json文件作为用户凭证
+但这个包不是oauth2的标准流程，而是创建jwt作为oauth2的access token。它作为一种优化的认证方式被部分谷歌的服务支持。这部分说明可以参考：developers.google.com/identity/pr…
+⚠️ golang.org/x/oauth2/jw…
+这是一个标准的jwt oauth2.0 的流程，它的交互可以参考谷歌文档，它能支持所有two-legged oauth2.0的服务，不仅限于谷歌的服务
+但它不是我们常规认为的jwt，而是使用jwt作为oauth2.0的一环
+
+⚠️ google.golang.org/grpc/creden…
+它使用 golang.org/x/oauth2/google 来实现gRPC的credentials.PerRPCCredentials，也就意味着它主要用作访问谷歌服务的认证
+go 体验AI代码助手 代码解读复制代码import (
+	"context"
+	"log"
+	"time"
+
+	pb "github.com/liangwt/note/grpc/authentication/ecommerce"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/oauth"
+	"google.golang.org/protobuf/types/known/wrapperspb"
+)
+
+func main() {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	jwtAuth, err := oauth.NewJWTAccessFromFile("./x509/winged-axon-372312-154a8b3aa89d.json")
+	if err != nil {
+		panic(err)
+	}
+
+	creds, err := credentials.NewClientTLSFromFile("./x509/rootCa.crt", "www.example.com")
+	if err != nil {
+		panic(err)
+	}
+
+	conn, err := grpc.Dial("localhost:8009",
+		grpc.WithTransportCredentials(creds),
+		grpc.WithPerRPCCredentials(jwtAuth))
+	if err != nil {
+		panic(err)
+	}
+  // ...
+}
+
+三个包的关系如下
+
+自定义的jwt
+上文说了golang.org/x/oauth2不能用
+自定义实现jwt可以使用github.com/golang-jwt/…库
+客户端代码
+客户端的token应该是由服务端返回的，而不是客户端自己生成的，这里只是为了方便演示
+主要逻辑是声明claims然后使用secret key进行签名
+go 体验AI代码助手 代码解读复制代码package main
+
+import (
+	"context"
+	"log"
+	"time"
+
+	"github.com/golang-jwt/jwt/v4"
+	pb "github.com/liangwt/note/grpc/authentication/ecommerce"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/protobuf/types/known/wrapperspb"
+)
+
+var _ credentials.PerRPCCredentials = JwtAuthentication{}
+
+type JwtAuthentication struct {
+	Key []byte
+}
+
+func (a JwtAuthentication) GetRequestMetadata(ctx context.Context, uri ...string) (map[string]string, error) {
+	// Create a new token object, specifying signing method and the claims
+	// you would like it to contain.
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.RegisteredClaims{
+		ID:        "example",
+		ExpiresAt: jwt.NewNumericDate(time.Now().Add(-2 * time.Hour)),
+	})
+
+	// Sign and get the complete encoded token as a string using the secret
+	tokenString, err := token.SignedString(a.Key)
+	if err != nil {
+		return nil, err
+	}
+
+	return map[string]string{
+		"authorization": "Bearer " + tokenString,
+	}, nil
+}
+
+func (b JwtAuthentication) RequireTransportSecurity() bool {
+	return true
+}
+
+func main() {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	creds, err := credentials.NewClientTLSFromFile("./x509/rootCa.crt", "www.example.com")
+	if err != nil {
+		panic(err)
+	}
+
+	jwtAuth := JwtAuthentication{[]byte("154a8b3aa89d3d4c49826f6dbbbe5542b5a9fbbb")}
+
+	conn, err := grpc.Dial("localhost:8009",
+		grpc.WithTransportCredentials(creds),
+		grpc.WithPerRPCCredentials(jwtAuth))
+	if err != nil {
+		panic(err)
+	}
+	defer conn.Close()
+
+	client := pb.NewOrderManagementClient(conn)
+
+	// Get Order
+	retrievedOrder, err := client.GetOrder(ctx, &wrapperspb.StringValue{Value: "101"})
+	if err != nil {
+		panic(err)
+	}
+
+	log.Printf("GetOrder Response -> : %+v\n", retrievedOrder)
+}
+
+
+服务端代码
+服务端代码使用拦截器，来对jwt进行验证
+go 体验AI代码助手 代码解读复制代码package main
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"strings"
+
+	"github.com/golang-jwt/jwt/v4"
+	pb "github.com/liangwt/note/grpc/authentication/ecommerce"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
+)
+
+var (
+	errMissingMetadata = status.Errorf(codes.InvalidArgument, "missing metadata")
+)
+
+func ensureValidBasicCredentials(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp interface{}, err error) {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return nil, errMissingMetadata
+	}
+
+	tokenString := strings.TrimPrefix(md["authorization"][0], "Bearer ")
+
+	token, err := jwt.ParseWithClaims(tokenString, &jwt.RegisteredClaims{}, func(token *jwt.Token) (interface{}, error) {
+		// Don't forget to validate the alg is what you expect:
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("Unexpected signing method: %v", token.Header["alg"])
+		}
+
+		return []byte("154a8b3aa89d3d4c49826f6dbbbe5542b5a9fbbb"), nil
+	})
+
+	claims, ok := token.Claims.(*jwt.RegisteredClaims)
+	if !ok || !token.Valid {
+		return nil, status.Errorf(codes.Unauthenticated, err.Error())
+	}
+
+	fmt.Println(claims.ID)
+
+	return handler(ctx, req)
+}
+
+func main() {
+	l, err := net.Listen("tcp", ":8009")
+	if err != nil {
+		panic(err)
+	}
+
+	creds, err := credentials.NewServerTLSFromFile("./x509/server.crt", "./x509/server.key")
+	s := grpc.NewServer(
+		grpc.UnaryInterceptor(ensureValidBasicCredentials),
+		grpc.Creds(creds),
+	)
+
+	pb.RegisterOrderManagementServer(s, &server{})
+
+	if err := s.Serve(l); err != nil {
+		panic(err)
+	}
+}
+
+总结
+🌲 gRPC可以支持各种各样的用户认证
+gRPC客户端提供在每一次调用注入用户凭证的能力
+我们需要实现credentials.PerRPCCredentials接口，并且在客户端创建链接的时候指定grpc.WithPerRPCCredentials(credentials.PerRPCCredentials)
+go 体验AI代码助手 代码解读复制代码type PerRPCCredentials interface {
+	// GetRequestMetadata 获取当前请求的metadata
+	GetRequestMetadata(ctx context.Context, uri ...string) (map[string]string, error)
+	// RequireTransportSecurity 是否使用安全的传输协议
+	RequireTransportSecurity() bool
+}
+
+gRPC服务端使用拦截器来验证每一个客户端的请求
+go 体验AI代码助手 代码解读复制代码type UnaryServerInterceptor func(ctx context.Context, req interface{}, info *UnaryServerInfo, handler UnaryHandler) (resp interface{}, err error)
+
+s := grpc.NewServer(
+    grpc.UnaryInterceptor(UnaryServerInterceptor),
+)
+
+利用以上两个特性，gRPC可以支持各种各样的用户认证
+🌲 传输层加密
+实现grpc.WithPerRPCCredentials()时RequireTransportSecurity如果设置了true，则必须设置合理的传输层加密方式（grpc.WithTransportCredentials()），否则会导致建立连接时失败
+🌲 gRPC中的jwt认证
+自定义实现jwt推荐使用github.com/golang-jwt/…库，golang.org/x/oauth2/jw…不是一个我们常规理解的jwt库
+
+
+作者：凉凉的知识库
+链接：https://juejin.cn/post/7229145941399027771
+来源：稀土掘金
+著作权归作者所有。商业转载请联系作者获得授权，非商业转载请注明出处。
