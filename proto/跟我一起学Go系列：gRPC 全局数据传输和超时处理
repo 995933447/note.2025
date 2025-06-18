@@ -1,0 +1,188 @@
+gRPC 在多个 GoRoutine 之间传递数据使用的是 Go SDK 提供的 Context 包。关于 Context 的使用可以看我之前的一篇文章：Context 使用。
+
+但是 Context 的使用场景是同一个进程内，gRPC 使用都是跨进程的网络传输，如果在某个调用链上 A 服务当前要调用 B 服务传递一些上下文参数并且也希望 B 服务继续往下传递该如何实现呢？
+
+跨进程的全局数据传输#
+再次回忆一下 gRPC 是基于 HTTP/2 协议的。那我们是不是可以再请求头中将这一部分数据 set 进去，而不是放在数据包里面。
+
+gRPC 也是如此实现的。进程间传输定义了一个 metadata 对象，该对象放在 Request-Headers 内：
+
+Copy
+Requests
+Request → Request-Headers *Length-Prefixed-Message EOS
+Request-Headers are delivered as HTTP2 headers in HEADERS + CONTINUATION frames.
+
+Request-Headers → Call-Definition *Custom-Metadata
+Call-Definition → Method Scheme Path TE [Authority] [Timeout] Content-Type [Message-Type] [Message-Encoding] [Message-Accept-Encoding] [User-Agent]
+Method → ":method POST"
+Scheme → ":scheme " ("http" / "https")
+Path → ":path" "/" Service-Name "/" {method name} # But see note below.
+Service-Name → {IDL-specific service name}
+......
+......
+......
+Custom-Metadata → Binary-Header / ASCII-Header
+......
+Custom-Metadata 字段内即为我们要传输的全局对象。具体文档可以看这里：PROTOCOL-HTTP2。
+
+所以通过 metadata 我们可以将上一个进程中的全局对象透传到下一个被调用的进程。查看源码可以发现 metadata 内部实际上是通过一个 map 对象存储数据：
+
+Copy
+type MD map[string][]string
+metadata 和 Context 一起连用的使用方式如下：
+
+发送方如果想发送一些全局字段给接收方，首先从自己端的 metadata set 数据：
+
+Copy
+//set 数据到 metadata
+md := metadata.Pairs("key", "val")
+// 新建一个有 metadata 的 context
+ctx := metadata.NewOutgoingContext(context.Background(), md)
+注意上面的 NewOutgoingContext() 方法，命名很形象，向外输出 Context。那么对端接收的时候肯定有一个对应的方法，我们继续往下看。这个新的 Context 就可以用来发送出去，比如还是我们上文中的示例方法：
+
+Copy
+//set 数据到 metadata
+md := metadata.Pairs("key", "val")
+// 新建一个有 metadata 的 context
+ctx := metadata.NewOutgoingContext(context.Background(), md)
+
+c = NewTokenServiceClient(conn)
+hello, err := c.SayHello(ctx, &PingMessage{Greeting: "hahah"})
+if err != nil {
+  fmt.Printf("could not greet: %v", err)
+}
+对于接收方来说，无非就是解析 metadata 中的数据。gRPC 已经帮我们将数据解析到 context 中，所以需要从 Context 中取出 MD 对象。
+
+Copy
+md, ok := metadata.FromIncomingContext(ctx)
+if !ok {
+  fmt.Printf("get metadata error")
+}
+if t, ok := md["key"]; ok {
+  fmt.Printf("key from metadata:\n")
+  for i, e := range t {
+    fmt.Printf(" %d. %s\n", i, e)
+  }
+}
+这里取数的逻辑使用了 metadata 的 FromIncomingContext() 方法。跟存数据的 NewOutgoingContext() 方法遥相呼应。
+
+跨进程的超时停止#
+同进程下跨 Goroutine 我们还是可以使用 Context 来设置当前 Context 管理下子 Goroutine 的有效期：
+
+Copy
+//超时截止
+context.WithTimeout(context.Background(), 100*time.Millisecond)
+//限制截止
+deadline, c2 := context.WithDeadline(context.Background(), deadline time.Time)
+gRPC 中同样实现了这个功能，即跨进程间的 Context 传递实现进程间的 Context 生命周期管理。我们看一个简单的例子：
+
+服务端：
+
+Copy
+package normal
+
+import (
+	"context"
+	"fmt"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/reflection"
+	pb "gorm-demo/models/pb"
+	"net"
+	"testing"
+	"time"
+)
+
+type server struct{}
+
+func (s *server) SayHello(ctx context.Context, in *pb.HelloRequest) (*pb.HelloReply, error) {
+	time.Sleep(3 * time.Second)
+	return &pb.HelloReply{Message: "Hello " + in.Name}, nil
+}
+
+//拦截器 - 打印日志
+func LoggingInterceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo,
+	handler grpc.UnaryHandler) (interface{}, error) {
+	fmt.Printf("gRPC method: %s, %v", info.FullMethod, req)
+	resp, err := handler(ctx, req)
+	fmt.Printf("gRPC method: %s, %v", info.FullMethod, resp)
+	return resp, err
+}
+
+func TestGrpcServer(t *testing.T) {
+	// 监听本地的8972端口
+	lis, err := net.Listen("tcp", ":8972")
+	if err != nil {
+		fmt.Printf("failed to listen: %v", err)
+		return
+	}
+	//注册拦截器
+	s := grpc.NewServer(grpc.UnaryInterceptor(LoggingInterceptor)) // 创建gRPC服务器
+	pb.RegisterGreeterServer(s, &server{})                         // 在gRPC服务端注册服务
+
+	reflection.Register(s) //在给定的gRPC服务器上注册服务器反射服务
+	// Serve方法在lis上接受传入连接，为每个连接创建一个ServerTransport和server的goroutine。
+	// 该goroutine读取gRPC请求，然后调用已注册的处理程序来响应它们。
+	err = s.Serve(lis)
+	if err != nil {
+		fmt.Printf("failed to serve: %v", err)
+		return
+	}
+
+}
+服务端代码我们在 SayHello() 方法中增加了 3s 的sleep。客户端代码如下：
+
+Copy
+package normal
+
+import (
+	"fmt"
+	"testing"
+	"time"
+
+	"golang.org/x/net/context"
+	"google.golang.org/grpc"
+	pb "gorm-demo/models/pb"
+)
+
+func TestGrpcClient(t *testing.T) {
+	// 连接服务器
+	conn, err := grpc.Dial(":8972", grpc.WithInsecure())
+	if err != nil {
+		fmt.Printf("faild to connect: %v", err)
+	}
+	defer conn.Close()
+
+	c := pb.NewGreeterClient(conn)
+
+	//timeout, cancelFunc := context.WithTimeout(context.Background(), time.Second*2)
+	//defer cancelFunc()
+
+	m, _ := time.ParseDuration("1s")
+	result := time.Now().Add(m)
+	deadline, c2 := context.WithDeadline(context.Background(), result)
+	defer c2()
+
+	// 调用服务端的SayHello
+	r, err := c.SayHello(deadline, &pb.HelloRequest{Name: "CN"})
+	if err != nil {
+		fmt.Printf("could not greet: %v", err)
+	}
+
+	fmt.Printf("Greeting: %s !\n", r.Message)
+}
+
+针对两种场景的超时：
+
+Copy
+//timeout, cancelFunc := context.WithTimeout(context.Background(), time.Second*2)
+//defer cancelFunc()
+
+m, _ := time.ParseDuration("1s")
+result := time.Now().Add(m)
+deadline, c2 := context.WithDeadline(context.Background(), result)
+defer c2()
+分别做了测试，大家可以运行一下代码看看效果。都会看到报错信息：
+
+Copy
+code = DeadlineExceeded desc = context deadline exceeded
+所以超时控制可以通过 Context 来操作，不必你自己再去额外写代码。
