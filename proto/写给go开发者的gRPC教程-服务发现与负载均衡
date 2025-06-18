@@ -11,7 +11,7 @@
 本系列将持续更新，欢迎关注 👏 获取实时通知
 
 对于一个客户端创建请求的过程
-go 体验AI代码助手 代码解读复制代码conn, err := grpc.Dial("example:8009", grpc.WithInsecure())
+go 体验AI代码助手 代码解读复制代码conn, err := grpc.Dial("example:///8009", grpc.WithInsecure())
 if err != nil {
   panic(err)
 }
@@ -206,7 +206,7 @@ func main() {
 		},
 	}))
 
-	conn, err := grpc.Dial("example:cluster@callee", grpc.WithInsecure())
+	conn, err := grpc.Dial("example:///cluster@callee", grpc.WithInsecure())
 	if err != nil {
 		panic(err)
 	}
@@ -245,7 +245,7 @@ gRPC目前内置四种策略
 旧版本gRPC使用 grpc.WithBalancerName("round_robin"),已经被废弃，使用grpc.WithDefaultServiceConfig。
 grpc.WithDefaultServiceConfig可以被上文服务发现中提到的cc.UpdateState(State) error覆盖配置
 
-go 体验AI代码助手 代码解读复制代码	conn, err := grpc.Dial("example:cluster@callee",
+go 体验AI代码助手 代码解读复制代码	conn, err := grpc.Dial("example:///cluster@callee",
 		grpc.WithInsecure(),
 		grpc.WithDefaultServiceConfig(
 			`{"loadBalancingPolicy":"round_robin"}`,
@@ -424,7 +424,7 @@ func main() {
 
 	balancer.Register(bl.NewBalancerBuilder())
 
-	conn, err := grpc.Dial("example:cluster@callee",
+	conn, err := grpc.Dial("example:///cluster@callee",
 		grpc.WithInsecure(),
 		grpc.WithDefaultServiceConfig(
 			`{"loadBalancingPolicy":"random_picker"}`,
