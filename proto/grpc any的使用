@@ -1,0 +1,37 @@
+package main
+
+import (
+	"fmt"
+	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/types/known/anypb"
+	pbs "prototest/prototest"
+)
+
+func main() {
+	p := &pbs.MyMessage{}
+	p2 := &pbs.MyMessage2{
+		Name: "123",
+	}
+	fmt.Println(p.ProtoReflect().Descriptor().Options())
+	//[my_option]:"Hello world!"
+	fmt.Println(p2.ProtoReflect().Descriptor().Options())
+	//<nil>
+	p.ProtoReflect().Descriptor().Options().ProtoReflect().Range(func(fd protoreflect.FieldDescriptor, v protoreflect.Value) bool {
+		fmt.Println(fd.FullName(), fd.Name(), v.String())
+		return true
+	})
+	var e error
+	// 写入
+	p.Data, e = anypb.New(p2)
+	if e != nil {
+		fmt.Println(e)
+		return
+	}
+	// 返回p2
+	pp, e := p.Data.UnmarshalNew()
+	if e != nil {
+		fmt.Println(e)
+		return
+	}
+	fmt.Println(pp)
+}
