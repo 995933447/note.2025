@@ -1,0 +1,61 @@
+proto定义：
+syntax = "proto3";
+
+package prototest2;
+
+option go_package = "main/";
+
+import "google/protobuf/descriptor.proto";
+import "google/protobuf/any.proto";
+
+
+extend google.protobuf.MessageOptions {
+   string my_option = 51234;
+}
+
+message MyMessage {
+    option (my_option) = "Hello world!";
+    google.protobuf.Any data = 1;
+}
+
+message MyMessage2 {
+  string name = 1;
+}
+
+demo代码：
+package main
+
+import (
+	"fmt"
+	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/types/known/anypb"
+)
+
+func main() {
+	p := &MyMessage{}
+	p2 := &MyMessage2{
+		Name: "123",
+	}
+	fmt.Println(p.ProtoReflect().Descriptor().Options())
+	//[my_option]:"Hello world!"
+	fmt.Println(p2.ProtoReflect().Descriptor().Options())
+	//<nil>
+	p.ProtoReflect().Descriptor().Options().ProtoReflect().Range(func(fd protoreflect.FieldDescriptor, v protoreflect.Value) bool {
+		fmt.Println(fd.FullName(), fd.Name(), v.String(), v.Interface())
+		return true
+	})
+	var e error
+	// 写入
+	p.Data, e = anypb.New(p2)
+	if e != nil {
+		fmt.Println(e)
+		return
+	}
+	// 返回p2
+	pp, e := p.Data.UnmarshalNew()
+	if e != nil {
+		fmt.Println(e)
+		return
+	}
+	fmt.Println(pp)
+}
