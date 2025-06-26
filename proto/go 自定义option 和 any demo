@@ -27,6 +27,7 @@ package main
 
 import (
 	"fmt"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/types/known/anypb"
 )
@@ -44,6 +45,14 @@ func main() {
 		fmt.Println(fd.FullName(), fd.Name(), v.String(), v.Interface())
 		return true
 	})
+
+	ext := proto.GetExtension(p.ProtoReflect().Descriptor().Options(), E_MyOption)
+	myOpt, ok := ext.(string)
+	if !ok {
+		return
+	}
+	fmt.Println("myOpt", myOpt)
+
 	var e error
 	// 写入
 	p.Data, e = anypb.New(p2)
