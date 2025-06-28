@@ -59,3 +59,15 @@ socket关闭
 从server的执行结果来看，在对方关闭的socket上执行read操作会得到EOF error，但write操作会成功，因为数据会成功写入己方的内核socket缓冲区中，即便最终发不到对方socket缓冲区了，因为己方socket并未关闭。因此当发现对方socket关闭后，己方应该正确合理处理自己的socket，再继续write已经无任何意义了
 
 https://www.secpulse.com/archives/65730.html
+
+其实上面这段说的有问题，不是客户端或者server的socket的表现，而是对方和己方socket关闭的不同表现：
+正确的补充：
+如果Go 语言中的socket 已经被关闭，再次写入通常会返回错误，但如果对方的socket 已经关闭，而你的socket 尚未关闭，那么在你的socket 缓冲区内写入数据仍然可能成功，即使数据最终无法到达对方的socket 缓冲区。﻿
+具体来说：
+己方关闭socket 后写入:
+如果你的Go 程序关闭了socket，然后尝试写入，会立即返回"use of closed network connection" 错误。﻿
+对方关闭socket 后写入:
+如果对方的socket 关闭了，但你的socket 尚未关闭，那么在你的socket 缓冲区内写入数据是可能成功的，因为数据会先写入你本地的内核socket 缓冲区。但是，由于对方的socket 已经关闭，这些数据最终无法被对方接收。﻿
+重要提示:
+无论哪种情况，一旦发现对方socket 关闭，你应该正确处理你自己的socket，例如关闭它，而不是继续写入，因为继续写入没有意义，数据无法送达对方。﻿
+简而言之，写入操作的成功与否取决于socket 是被谁关闭的，以及是否已经有数据在本地的socket 缓冲区中。但是，无论哪种情况，当发现socket 关闭后，都应该正确处理，避免不必要的错误和资源浪费
