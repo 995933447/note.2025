@@ -1,0 +1,437 @@
+1.首先一个rpcx是一个对端地址维护一个连接的。对同一个对端地址的写入是串行的：
+func (c *xClient) getCachedClient(k string, servicePath, serviceMethod string, args interface{}) (RPCClient, error) {
+	// TODO: improve the lock
+	var client RPCClient
+	var needCallPlugin bool
+	defer func() {
+		if needCallPlugin {
+			c.Plugins.DoClientConnected(client.GetConn())
+		}
+	}()
+
+	if c.isShutdown {
+		return nil, errors.New("this xclient is closed")
+	}
+
+	// if this client is broken
+	breaker, ok := c.breakers.Load(k)
+	if ok && !breaker.(Breaker).Ready() {
+		return nil, ErrBreakerOpen
+	}
+
+	c.mu.Lock()
+	client = c.findCachedClient(k, servicePath, serviceMethod)
+	if client != nil {
+		if !client.IsClosing() && !client.IsShutdown() {
+			c.mu.Unlock()
+			return client, nil
+		}
+		c.deleteCachedClient(client, k, servicePath, serviceMethod)
+	}
+
+	client = c.findCachedClient(k, servicePath, serviceMethod)
+	c.mu.Unlock()
+
+	if client == nil || client.IsShutdown() {
+		generatedClient, err, _ := c.slGroup.Do(k, func() (interface{}, error) {
+			return c.generateClient(k, servicePath, serviceMethod)
+		})
+
+		if err != nil {
+			c.slGroup.Forget(k)
+			return nil, err
+		}
+
+		client = generatedClient.(RPCClient)
+		if c.Plugins != nil {
+			needCallPlugin = true
+		}
+
+		client.RegisterServerMessageChan(c.serverMessageChan)
+
+		c.mu.Lock()
+		c.setCachedClient(client, k, servicePath, serviceMethod)
+		c.mu.Unlock()
+
+		// forget k only when client is cached
+		c.slGroup.Forget(k)
+	}
+
+	return client, nil
+}
+
+func (c *xClient) setCachedClient(client RPCClient, k, servicePath, serviceMethod string) {
+	network, _ := splitNetworkAndAddress(k)
+	if builder, ok := getCacheClientBuilder(network); ok {
+		builder.SetCachedClient(client, k, servicePath, serviceMethod)
+		return
+	}
+
+	c.cachedClient[k] = client
+}
+
+写入的时候，同一个地址用同一个tcp conn串行写入，并且为每次请求分配一个seq做为req id和本次请求数据map映射起来。
+// Go invokes the function asynchronously. It returns the Call structure representing
+// the invocation. The done channel will signal when the call is complete by returning
+// the same Call object. If done is nil, Go will allocate a new channel.
+// If non-nil, done must be buffered or Go will deliberately crash.
+func (client *Client) Go(ctx context.Context, servicePath, serviceMethod string, args interface{}, reply interface{}, done chan *Call) *Call {
+	call := new(Call)
+	call.ServicePath = servicePath
+	call.ServiceMethod = serviceMethod
+	meta := ctx.Value(share.ReqMetaDataKey)
+	if meta != nil { // copy meta in context to meta in requests
+		call.Metadata = meta.(map[string]string)
+	}
+
+	if !share.IsShareContext(ctx) {
+		ctx = share.NewContext(ctx)
+	}
+
+	call.Args = args
+	call.Reply = reply
+	if done == nil {
+		done = make(chan *Call, 10) // buffered.
+	} else {
+		// If caller passes done != nil, it must arrange that
+		// done has enough buffer for the number of simultaneous
+		// RPCs that will be using that channel. If the channel
+		// is totally unbuffered, it's best not to run at all.
+		if cap(done) == 0 {
+			log.Panic("rpc: done channel is unbuffered")
+		}
+	}
+	call.Done = done
+
+	if share.Trace {
+		log.Debugf("client.Go send request for %s.%s, args: %+v in case of client call", servicePath, serviceMethod, args)
+	}
+
+	go client.send(ctx, call)
+
+	return call
+}
+
+func (client *Client) send(ctx context.Context, call *Call) {
+	// Register this call.
+	client.mutex.Lock()
+	if client.shutdown || client.closing {
+		call.Error = ErrShutdown
+		client.mutex.Unlock()
+		call.done()
+		return
+	}
+
+	isHeartbeat := call.ServicePath == "" && call.ServiceMethod == ""
+	serializeType := client.option.SerializeType
+	if isHeartbeat {
+		serializeType = protocol.MsgPack
+	}
+	codec := share.Codecs[serializeType]
+	if codec == nil {
+		call.Error = ErrUnsupportedCodec
+		client.mutex.Unlock()
+		call.done()
+		return
+	}
+
+	if client.pending == nil {
+		client.pending = make(map[uint64]*Call)
+	}
+
+	seq := client.seq
+	client.seq++
+	client.pending[seq] = call
+	client.mutex.Unlock()
+
+	if cseq, ok := ctx.Value(seqKey{}).(*uint64); ok {
+		*cseq = seq
+	}
+
+	// req := protocol.NewMessage()
+	req := protocol.NewMessage()
+	req.SetMessageType(protocol.Request)
+	req.SetSeq(seq)
+	if call.Reply == nil {
+		req.SetOneway(true)
+	}
+
+	// heartbeat, and use default SerializeType (msgpack)
+	if isHeartbeat {
+		req.SetHeartbeat(true)
+		req.SetSerializeType(protocol.MsgPack)
+	} else {
+		req.SetSerializeType(client.option.SerializeType)
+	}
+
+	if call.Metadata != nil {
+		req.Metadata = call.Metadata
+	}
+
+	req.ServicePath = call.ServicePath
+	req.ServiceMethod = call.ServiceMethod
+
+	data, err := codec.Encode(call.Args)
+	if err != nil {
+		client.mutex.Lock()
+		delete(client.pending, seq)
+		client.mutex.Unlock()
+		call.Error = err
+		call.done()
+		return
+	}
+	if len(data) > 1024 && client.option.CompressType != protocol.None {
+		req.SetCompressType(client.option.CompressType)
+	}
+
+	req.Payload = data
+
+	if client.Plugins != nil {
+		_ = client.Plugins.DoClientBeforeEncode(req)
+	}
+
+	if share.Trace {
+		log.Debugf("client.send for %s.%s, args: %+v in case of client call", call.ServicePath, call.ServiceMethod, call.Args)
+	}
+	allData := req.EncodeSlicePointer()
+	_, err = client.Conn.Write(*allData)
+	protocol.PutData(allData)
+	if share.Trace {
+		log.Debugf("client.sent for %s.%s, args: %+v in case of client call", call.ServicePath, call.ServiceMethod, call.Args)
+	}
+
+	if err != nil {
+		if e, ok := err.(*net.OpError); ok {
+			if e.Err != nil {
+				err = fmt.Errorf("net.OpError: %s", e.Err.Error())
+			} else {
+				err = errors.New("net.OpError")
+			}
+
+		}
+		client.mutex.Lock()
+		call = client.pending[seq]
+		delete(client.pending, seq)
+		client.mutex.Unlock()
+		if call != nil {
+			call.Error = err
+			call.done()
+		}
+
+		return
+	}
+
+	isOneway := req.IsOneway()
+
+	if isOneway {
+		client.mutex.Lock()
+		call = client.pending[seq]
+		delete(client.pending, seq)
+		client.mutex.Unlock()
+		if call != nil {
+			call.done()
+		}
+	}
+
+	if client.option.IdleTimeout != 0 {
+		_ = client.Conn.SetDeadline(time.Now().Add(client.option.IdleTimeout))
+	}
+}
+
+读取的时候，用一个单独的go单线程循环读取数据，并根据回报中header的seq和内存里的请求信息call对象关联起来，写入reply:
+func (client *Client) Connect(network, address string) error {
+	var conn net.Conn
+	var err error
+
+	switch network {
+	case "http":
+		conn, err = newDirectHTTPConn(client, network, address)
+	case "ws", "wss":
+		conn, err = newDirectWSConn(client, network, address)
+	default:
+		fn := ConnFactories[network]
+		if fn != nil {
+			conn, err = fn(client, network, address)
+		} else {
+			conn, err = newDirectConn(client, network, address)
+		}
+	}
+
+	if err == nil && conn != nil {
+		if tc, ok := conn.(*net.TCPConn); ok && client.option.TCPKeepAlivePeriod > 0 {
+			_ = tc.SetKeepAlive(true)
+			_ = tc.SetKeepAlivePeriod(client.option.TCPKeepAlivePeriod)
+		}
+
+		if client.option.IdleTimeout != 0 {
+			_ = conn.SetDeadline(time.Now().Add(client.option.IdleTimeout))
+		}
+
+		if client.Plugins != nil {
+			conn, err = client.Plugins.DoConnCreated(conn)
+			if err != nil {
+				return err
+			}
+		}
+
+		client.Conn = conn
+		client.r = bufio.NewReaderSize(conn, ReaderBuffsize)
+		// c.w = bufio.NewWriterSize(conn, WriterBuffsize)
+
+		// start reading and writing since connected
+		go client.input()
+
+		if client.option.Heartbeat && client.option.HeartbeatInterval > 0 {
+			go client.heartbeat()
+		}
+
+	}
+
+	if err != nil && client.Plugins != nil {
+		client.Plugins.DoConnCreateFailed(network, address)
+	}
+
+	return err
+}
+
+func (client *Client) input() {
+	var err error
+
+	for err == nil {
+		res := protocol.NewMessage()
+		if client.option.IdleTimeout != 0 {
+			_ = client.Conn.SetDeadline(time.Now().Add(client.option.IdleTimeout))
+		}
+
+		err = res.Decode(client.r)
+		if err != nil {
+			break
+		}
+		if client.Plugins != nil {
+			_ = client.Plugins.DoClientAfterDecode(res)
+		}
+
+		seq := res.Seq()
+		var call *Call
+		isServerMessage := (res.MessageType() == protocol.Request && !res.IsHeartbeat() && res.IsOneway())
+		if !isServerMessage {
+			client.mutex.Lock()
+			call = client.pending[seq]
+			delete(client.pending, seq)
+			client.mutex.Unlock()
+		}
+
+		if share.Trace {
+			log.Debugf("client.input received %v", res)
+		}
+
+		switch {
+		case call == nil:
+			if isServerMessage {
+				if client.ServerMessageChan != nil {
+					client.handleServerRequest(res)
+				}
+				continue
+			}
+		case res.MessageStatusType() == protocol.Error:
+			// We've got an error response. Give this to the request
+			if len(res.Metadata) > 0 {
+				call.ResMetadata = res.Metadata
+
+				// convert server error to a customized error, which implements ServerError interface
+				if ClientErrorFunc != nil {
+					call.Error = ClientErrorFunc(res.Metadata[protocol.ServiceError])
+				} else {
+					call.Error = strErr(res.Metadata[protocol.ServiceError])
+				}
+
+			}
+
+			if call.Raw {
+				call.Metadata, call.Reply, _ = convertRes2Raw(res)
+				call.Metadata[XErrorMessage] = call.Error.Error()
+			} else if len(res.Payload) > 0 {
+				data := res.Payload
+				codec := share.Codecs[res.SerializeType()]
+				if codec != nil {
+					_ = codec.Decode(data, call.Reply)
+				}
+			}
+			call.done()
+		default:
+			if call.Raw {
+				call.Metadata, call.Reply, _ = convertRes2Raw(res)
+			} else {
+				data := res.Payload
+				if len(data) > 0 {
+					codec := share.Codecs[res.SerializeType()]
+					if codec == nil {
+						call.Error = strErr(ErrUnsupportedCodec.Error())
+					} else {
+						err = codec.Decode(data, call.Reply)
+						if err != nil {
+							call.Error = strErr(err.Error())
+						}
+					}
+				}
+				if len(res.Metadata) > 0 {
+					call.ResMetadata = res.Metadata
+				}
+
+			}
+
+			call.done()
+		}
+	}
+	// Terminate pending calls.
+
+	if client.ServerMessageChan != nil {
+		req := protocol.NewMessage()
+		req.SetMessageType(protocol.Request)
+		req.SetMessageStatusType(protocol.Error)
+		if req.Metadata == nil {
+			req.Metadata = make(map[string]string)
+			if err != nil {
+				req.Metadata[protocol.ServiceError] = err.Error()
+			}
+		}
+		req.Metadata["server"] = client.Conn.RemoteAddr().String()
+		client.handleServerRequest(req)
+	}
+
+	client.mutex.Lock()
+	if !client.pluginClosed {
+		if client.Plugins != nil {
+			client.Plugins.DoClientConnectionClose(client.Conn)
+		}
+		client.pluginClosed = true
+	}
+	client.Conn.Close()
+	client.shutdown = true
+	closing := client.closing
+	if e, ok := err.(*net.OpError); ok {
+		if e.Addr != nil || e.Err != nil {
+			err = fmt.Errorf("net.OpError: %s", e.Err.Error())
+		} else {
+			err = errors.New("net.OpError")
+		}
+
+	}
+	if err == io.EOF {
+		if closing {
+			err = ErrShutdown
+		} else {
+			err = io.ErrUnexpectedEOF
+		}
+	}
+	for _, call := range client.pending {
+		call.Error = err
+		call.done()
+	}
+
+	client.mutex.Unlock()
+
+	if err != nil && !closing {
+		log.Errorf("rpcx: client protocol error: %v", err)
+	}
+}
