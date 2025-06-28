@@ -26,8 +26,6 @@ Go
 
 
 
-
-
 conn.Read
 
 socket无数据：read阻塞，直到有数据。
@@ -60,3 +58,4 @@ socket关闭
 
 从server的执行结果来看，在对方关闭的socket上执行read操作会得到EOF error，但write操作会成功，因为数据会成功写入己方的内核socket缓冲区中，即便最终发不到对方socket缓冲区了，因为己方socket并未关闭。因此当发现对方socket关闭后，己方应该正确合理处理自己的socket，再继续write已经无任何意义了
 
+https://www.secpulse.com/archives/65730.html
