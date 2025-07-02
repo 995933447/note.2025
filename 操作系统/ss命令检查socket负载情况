@@ -1,0 +1,64 @@
+ss -ti
+如：
+ESTAB       0      0                                                                 172.70.43.229:57306                                                                           172.21.43.121:irtrans              
+         cubic wscale:7,7 rto:204 rtt:2.498/2.591 ato:40 mss:8949 rcvmss:8949 advmss:8949 cwnd:10 bytes_acked:349991875 bytes_received:364619159 segs_out:929558 segs_in:484797 data_segs_out:464856 data_segs_in:466676 send 286.6Mbps lastsnd:744 lastrcv:740 lastack:740 pacing_rate 573.1Mbps delivery_rate 7954.7Mbps app_limited busy:1198088ms retrans:0/179 rcv_rtt:1.708 rcv_space:1182833 minrtt:0.023
+
+         这条信息描述的是 TCP 连接的当前状态，结合各个字段分析如下：
+
+cubic wscale:7,7：TCP拥塞控制算法是CUBIC，窗口缩放因子为7。
+
+rto:204：重传超时时间204毫秒。
+
+rtt:1.814/1.135：当前往返时延（RTT）平均值1.814ms，偏差1.135ms。
+
+ato:40：ACK超时，40毫秒。
+
+mss:8949：最大报文段长度8949字节。
+
+rcvmss:1503：接收方MSS，1503字节。
+
+adv_mss:8949：协商的MSS。
+
+cwnd:10：拥塞窗口大小为10个MSS。
+
+bytes_acked:9038476：已确认的数据字节数。
+
+bytes_received:9104127：接收的数据字节数。
+
+segs_out:22350、segs_in:11361：发送和接收的包数。
+
+data_segs_out:11178、data_segs_in:11173：实际数据包的发送和接收数。
+
+send:394.7Mbps：发送端当前发送速率约395 Mbps。
+
+lastsnd:156：距离上次发送报文156毫秒。
+
+lastrcv:152：距离上次接收报文152毫秒。
+
+lastack:152：距离上次收到ACK 152毫秒。
+
+pacing_rate:788.9Mbps：拥塞控制计算的最大发送速率约789 Mbps。
+
+delivery_rate:237.8Mbps：实际数据确认速率约238 Mbps。
+
+app_limited:busy:30068ms：应用层有限制，约30秒时间里应用未持续满速发送数据。
+
+retrans:0/5：重传0个数据包，5个控制包。
+
+rcv_rtt:1.855：接收端从收到数据到内核读取确认的平均时间约1.855ms。
+
+rcv_space:56587：接收缓冲区剩余空间为56587字节。
+
+minrtt:0.386：历史最小RTT为0.386毫秒。
+
+结合你数据的解读：
+发送速率394.7 Mbps vs 实际delivery_rate 237.8 Mbps
+说明应用层虽然尝试以接近395 Mbps速率发送数据，但实际被网络确认（delivery_rate）只有238 Mbps，网络带宽或拥塞控制限制了有效数据速率。
+
+pacing_rate高于send速率，表示TCP拥塞控制认为还可以发送更高速率，但应用层限制了实际发送速率。
+
+app_limited较大（30068ms），说明应用没有持续满速发送，应用层限制了发送速度。
+
+rcv_rtt和rtt较低且接收缓冲区空间充足（56587字节），说明接收端处理及时，缓冲未满。
+
+没有明显重传，网络状况整体较好，拥塞控制较稳定。
