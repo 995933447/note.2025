@@ -1,4 +1,4 @@
-GODEBUG=schedtrace=1000,gctrace=1 ./exec_file
+GODEBUG=schedtrace=1000,scheddetail=1,gctrace=1 ./exec_file
 
 GODEBUG=schedtrace=1000,gctrace=1 是 Go 的运行时调试环境变量，用于输出 调度器 (scheduler) 和 垃圾回收器 (GC) 的实时日志信息，帮助你观察和诊断程序在高并发、高负载或卡顿等场景下的运行时行为。
 
@@ -115,4 +115,58 @@ runnable g=X	当前处于就绪状态（等待执行）的 goroutine 数
 waiting g=Y	阻塞在通道、锁、select、sleep、timer 等的 goroutine
 syscall g=Z	正在执行系统调用的 goroutine
 idle g=N	当前空闲状态的 goroutine（理论上为 0）
+
+
+
+GODEBUG=schedtrace=1000,netdns=2,asyncpreemptoff=1 是什么意思
+
+
+ChatGPT 说：
+这个环境变量：
+
+ini
+复制
+编辑
+GODEBUG=schedtrace=1000,netdns=2,asyncpreemptoff=1
+是在调试 Go 程序时非常常用的一种组合。下面是它的逐项解释：
+
+✅ schedtrace=1000
+含义：每隔 1000 毫秒（1 秒）打印一次 调度器状态。
+
+输出示例：
+
+yaml
+复制
+编辑
+SCHED 105620ms: gomaxprocs=10 idleprocs=0 threads=25 spinningthreads=0 ...
+作用：观察系统是否线程饥饿、是否有 goroutine 堆积、是否缺乏空闲 P、是否缺少 spinning M 等。
+
+✅ netdns=2
+含义：打印 DNS 解析的详细信息，包括使用的是哪种解析器（go 还是 cgo/libc）、每次 DNS 查询细节。
+
+输出示例：
+
+csharp
+复制
+编辑
+go: using DNS resolver: cgo
+lookup internal.service: getaddrinfo ...
+作用：检查 DNS 是否在阻塞请求或导致线程卡住。你可以确认是否使用了非阻塞的 Go 解析器（推荐 go 而不是 cgo）。
+
+✅ asyncpreemptoff=1
+含义：关闭异步抢占（async preemption）机制。
+
+解释：
+
+Go 1.14 开始引入了 "async preemption"（异步抢占）来让调度器在某些点强制中断长期运行的 goroutine。
+
+设置为 1 会关闭这个机制，使 goroutine 只在函数调用点被抢占。
+
+作用：排查调度相关问题时使用，避免调度器主动打断 goroutine，便于调试 goroutine 行为（例如查看某个 goroutine 是否永远不让出 CPU）。
+
+📌 总结：这个组合常用于什么场景？
+用途	原因
+🧠 观察调度器行为	schedtrace=1000 可以帮助你理解 goroutine 是否堆积、是否 M 不够用
+🌐 检查 DNS 阻塞	netdns=2 能确认 DNS 是否使用阻塞方式（libc）或者哪个服务器慢
+🔍 精细调度排查	asyncpreemptoff=1 让 goroutine 不被强制中断，有助于重现问题现场
 
