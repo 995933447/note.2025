@@ -1,0 +1,118 @@
+GODEBUG=schedtrace=1000,gctrace=1 ./exec_file
+
+GODEBUG=schedtrace=1000,gctrace=1 是 Go 的运行时调试环境变量，用于输出 调度器 (scheduler) 和 垃圾回收器 (GC) 的实时日志信息，帮助你观察和诊断程序在高并发、高负载或卡顿等场景下的运行时行为。
+
+✅ 参数详解
+🔹 schedtrace=1000
+含义：每隔 1000 毫秒（即 1 秒），打印一次 调度器运行状态
+
+单位：毫秒
+
+作用：观察 goroutine、线程、P 的使用情况，以及调度队列长度等指标
+
+🔧 示例输出（你之前给过）：
+
+yaml
+复制
+编辑
+SCHED 93568ms: gomaxprocs=10 idleprocs=0 threads=19 spinningthreads=0 needspinning=1 idlethreads=5 runqueue=7070 [0 4 0 68 45 71 102 69 82 114]
+字段解释如下：
+
+字段	含义
+gomaxprocs	当前运行的 P 的数量（GOMAXPROCS）
+idleprocs	空闲的 P 数量
+threads	创建的 M（线程）数量
+spinningthreads	正在 “自旋” 等待工作的线程数
+needspinning	是否需要更多线程去自旋抢活
+idlethreads	空闲 M 的数量
+runqueue	全局 G 队列长度（阻塞 goroutine 数）
+[0 4 ...]	每个 P 的本地 runqueue 中的 goroutine 数量
+
+🔹 gctrace=1
+含义：每次 GC 运行时，打印一条 垃圾回收日志
+
+用于分析 GC 时间、频率、暂停时间等
+
+🔧 示例输出：
+
+rust
+复制
+编辑
+gc 1 @3.264s 2%: 0.051+0.57+0.014 ms clock, 0.10+0.28/0.89/1.3+0.028 ms cpu, 4->4->0 MB, 5 MB goal, 10 P
+字段解释如下：
+
+字段	含义
+gc 1 @3.264s	第 1 次 GC，在程序运行 3.264 秒时触发
+2%	GC 占用总时间的 2%
+0.051+0.57+0.014 ms clock	STW（stop-the-world）开始时间 + 标记时间 + STW 结束时间
+0.10+0.28/0.89/1.3+0.028 ms cpu	CPU 时间分布：辅助 GC + 并发标记清理等
+4->4->0 MB	GC 前活跃堆大小 -> GC 后活跃堆大小 -> 最终保留堆大小
+5 MB goal	本次 GC 目标堆大小
+10 P	当前系统使用的 P 数量（处理器数量）
+
+✅ 使用方式
+在命令行执行你的程序时设置：
+
+bash
+复制
+编辑
+GODEBUG=schedtrace=1000,gctrace=1 ./your_program
+或者在 go test 中：
+
+bash
+复制
+编辑
+GODEBUG=schedtrace=1000,gctrace=1 go test -v ./...
+✅ 典型用途
+场景	用法
+goroutine 暴增 / 卡住	观察 runqueue 是否堆积、idlethreads 是否闲置
+调度饥饿	看 needspinning=1 但 spinningthreads=0（没人抢活）
+GC 过于频繁或 STW 过久	用 gctrace=1 查看 GC 时间和触发频率
+多核利用差	看 gomaxprocs=10 但 idleprocs=9
+
+
+
+
+GODEBUG=schedtrace=1000,scheddetail=1的含义
+
+ChatGPT 说：
+GODEBUG=schedtrace=1000,scheddetail=1 是用于调试 Go 程序调度器（scheduler）行为的环境变量设置，配合使用可以输出更加详细的调度信息，用于定位 goroutine 执行缓慢、调度阻塞、资源分配不均、P（处理器）利用率低等问题。
+
+🧠 参数详解
+🔹 schedtrace=1000
+含义：每隔 1000 毫秒（即 1 秒）打印一次调度器状态快照。
+
+单位：毫秒
+
+提供调度器全局概况（GOMAXPROCS、线程数、就绪队列、空闲线程数等）。
+
+示例输出（你已经见过）：
+
+yaml
+复制
+编辑
+SCHED 93568ms: gomaxprocs=10 idleprocs=0 threads=19 spinningthreads=0 needspinning=1 idlethreads=5 runqueue=7070 [0 4 0 68 45 71 102 69 82 114]
+解释见上一条回答。
+
+🔹 scheddetail=1
+含义：配合 schedtrace 使用时，会在每次调度打印中输出 更多详细信息。
+
+包括：各类 goroutine 数量（runnable、waiting、syscall 等）、调度器内部状态等。
+
+该参数对定位高并发调度异常、g 阻塞等问题非常有帮助。
+
+示例附加信息：
+
+perl
+复制
+编辑
+SCHED 1004ms: gomaxprocs=4 idleprocs=0 threads=8 spinningthreads=0 idlethreads=2 runqueue=342
+runnable g=1120 waiting g=110 syscall g=5 idle g=0
+新增字段说明：
+
+字段	含义
+runnable g=X	当前处于就绪状态（等待执行）的 goroutine 数
+waiting g=Y	阻塞在通道、锁、select、sleep、timer 等的 goroutine
+syscall g=Z	正在执行系统调用的 goroutine
+idle g=N	当前空闲状态的 goroutine（理论上为 0）
+
