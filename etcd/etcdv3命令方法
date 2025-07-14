@@ -1,0 +1,4 @@
+ export ETCDCTL_API=3 && ./etcdctl --endpoints=http://10.5.1.2:2379 get dir/subdir
+
+ 如果只看key
+ export ETCDCTL_API=3 && ./etcdctl --endpoints=http://10.5.1.2:2379 get dir/subdir --prefix --keys-only
