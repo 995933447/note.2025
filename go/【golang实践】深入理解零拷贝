@@ -1,0 +1,298 @@
+【golang实践】深入理解零拷贝
+1. 什么是零拷贝？
+零拷贝就是一种避免 CPU 将数据从一块存储拷贝到另外一块存储的技术。每一次拷贝都会造成不必要的开销。
+
+2. 零拷贝的发展
+我们以http连接中的数据拷贝分析。该场景就是创建一个http服务器，服务端从本地的文件读取内容并返回给客户端。
+
+2.1 read和write
+通过read读取磁盘中的文件数据，然后使用write系统调用
+实践场景
+ package main
+ ​
+ import (
+     "net/http"
+     "os"
+ )
+ ​
+ func main() {
+     http.HandleFunc("/hello", func(writer http.ResponseWriter, request *http.Request) {
+ ​
+         f, _ := os.Open("./hello.txt")
+         buf := make([]byte, 1024)
+         // 内核拷贝到buf
+         n, _ := f.Read(buf)
+         // buf拷贝到内核
+         writer.Write(buf[:n])
+     })
+     http.ListenAndServe(":8080", http.DefaultServeMux)
+ }
+ ​
+上面代码是将本地hello.txt文件的内容读出来返回给客户端。
+
+结果：
+
+
+
+
+
+系统调用过程
+利用strace跟踪其系统调用：
+
+值得注意的是：
+运行程序的时候使用go build -o main main.go 然后运行./main。 如果strace跟踪的是go run main.go。系统调用过程不完整。
+我使用的方法：
+go build -o main main.go
+strace ./main
+curl 127.0.0.1:8080/hello
+
+
+
+
+
+
+
+数据拷贝过程
+
+
+
+
+
+read和write会发生四次内核缓冲区。如何减少拷贝次数？
+
+2.2 mmap + write
+该运行在linux环境。
+mmap概念：
+
+mmap的作用，在应用这一层，是让你把文件的某一段，当作内存一样来访问。将文件映射到物理内存，将进程虚拟空间映射到那块内存。这样，进程不仅能像访问内存一样读写文件，多个进程映射同一文件，还能保证虚拟空间映射到同一块物理内存，达到内存共享的作用。
+
+mmap 具有如下的特点：
+
+mmap 向应用程序提供的内存访问接口是内存地址连续的，但是对应的磁盘文件的 block 可以不是地址连续的；
+mmap 提供的内存空间是虚拟空间（虚拟内存），而不是物理空间（物理内存），因此完全可以分配远远大于物理内存大小的虚拟空间（例如 16G 内存主机分配 1000G 的 mmap 内存空间）；
+mmap 负责映射文件逻辑上一段连续的数据（物理上可以不连续存储）映射为连续内存，而这里的文件可以是磁盘文件、驱动假造出的文件（例如 DMA 技术）以及设备；
+mmap 由操作系统负责管理，对同一个文件地址的映射将被所有线程共享，操作系统确保线程安全以及线程可见性；
+mmap 的设计很有启发性。基于磁盘的读写单位是 block（一般大小为 4KB），而基于内存的读写单位是地址（虽然内存的管理与分配单位是 4KB）。
+换言之，CPU 进行一次磁盘读写操作涉及的数据量至少是 4KB，但是进行一次内存操作涉及的数据量是基于地址的，也就是通常的 64bit（64 位操作系统）。mmap 下进程可以采用指针的方式进行读写操作，这是值得注意的。
+
+实践场景
+ package main
+ ​
+ import (
+     "net/http"
+     "os"
+     "syscall"
+ )
+ ​
+ func main() {
+     http.HandleFunc("/mmap", func(writer http.ResponseWriter, request *http.Request) {
+         f, _ := os.Open("./hello.txt")
+         data, err := syscall.Mmap(int(f.Fd()), 0, 12, syscall.PROT_READ, syscall.MAP_SHARED) // mmap返回了一个data的字节数组，这个字节数组的内容就是映射了文件内容
+         /*
+         syscall.Mmap(int(f.Fd()), 0, 12, syscall.PROT_READ, syscall.MAP_SHARED)
+         mmap涉及的参数含义:
+         第一个：要映射的文件描述符。
+         第二、三个：映射的范围是从0个字节到第12个字节（也就是 Hello World!）。
+         第四个:代表映射的后的内存区域是只读的，类似的参数还有 syscall.PROT_WRITE表示内存区域可以被写入，syscall.PROT_NONE表示内存区域不可访问。
+         第五个：映射的内存区域可以被多个进程共享，这样一个进程修改了这个内存区域的数据，对其他进程是可见的，并且修改后的内容会自动被操作系统同步到磁盘文件里。
+         */
+         if err != nil {
+             panic(err)
+         }
+         writer.Write(data)
+     })
+     http.ListenAndServe(":8080", http.DefaultServeMux)
+ }
+上面代码是将本地hello.txt文件的内容读出来返回给客户端。路径是/mmap. 通过curl 127.0.0.1:8080/mmap调用。
+
+系统调用过程
+利用strace跟踪其系统调用：
+
+
+
+
+
+
+可以看出更改完文件状态调用mmap。
+
+数据拷贝过程
+mmap是没有将文件内容读取到用户空间的任何缓冲区的。仅仅是在write系统调用时，告诉了内核一个地址(即字节数组的地址)，而这个地址被mmap映射成了文件的地址。示意图如下:
+
+
+
+
+
+
+2.3 sendfile
+基于上述mmap+write方式进行优化后的文件内容访问减少了一次拷贝过程，不过系统调用还是两次。如果用sendfile的话可以将系统调用减少到一次。
+
+ func Sendfile(outfd int, infd int, offset *int64, count int) (written int, err error) 
+sendfile概念：
+sendfile系统调用是Linux为了提高文件传输效率而提供的一种系统调用，它可以直接将文件数据从内核缓存拷贝到套接字缓存。
+
+当用户程序调用sendfile时，以下步骤将会被执行：
+
+内核打开文件，准备读取数据。数据被读取到内核的缓冲区。
+内核然后将数据从内核的缓冲区复制到套接字的缓冲区。
+最后，数据被发送到网络。
+sendfile的使用受到了一些限制，比如源文件描述符必须支持mmap系统调用，也就是说源文件描述符通常代表的是真实的文件，而不能是套接字或管道。
+
+数据拷贝过程
+Sendfile的系统调用可以将目的文件描述符和源文件描述符传递进去，剩下的拷贝过程就交给内核了。示意图如下:
+
+
+
+
+image.png
+
+但是sendfile对源文件描述符有要求，普通的文件可以，如果源文件描述符是socket则不能用sendfile了。这是因为网络套接字的数据并不直接存在于文件系统中，而是通过网络接收的。此外，网络套接字的数据可能需要进行一些额外的处理（例如TCP的序列号处理、重传等），这些处理在内核空间中进行，而 sendfile 函数在设计时没有考虑到这些因素。
+
+2.4 splice
+splice系统调用则是为了解决源文件描述符和目的文件描述符都是socket的情况而产生的。splice系统调用的原理是通过管道让数据在源socket和目的socket之间进行传输。
+
+在调用 splice 时，数据可以在两个文件描述符之间直接移动，而不需要通过用户空间的缓冲区。这可以用于多种场景，例如在两个套接字之间或者在文件和套接字之间传输数据。
+
+当你调用 splice 系统调用时，以下步骤会被执行：
+
+内核打开源文件描述符，准备读取数据。
+内核将数据从源文件描述符读取到一个管道中。
+内核然后将数据从管道中写入到目标文件描述符。
+实践场景：
+ package main
+ /*
+ #define _GNU_SOURCE
+ #include <errno.h>
+ #include <fcntl.h>
+ #include <stdio.h>
+ #include <unistd.h>
+ #include <string.h>
+ ​
+ char* mysplice(int fd_in, int fd_out, size_t len) {
+     ssize_t ret = splice(fd_in, NULL, fd_out, NULL, len, SPLICE_F_MOVE);
+     /*
+     各参数含义：
+     1.fd_in: 这是输入文件描述符，数据将从这个文件描述符中读取。
+     2.off_in: 这是一个指向loff_t类型变量的指针，表示从输入文件的哪个偏移量开始读取数据。如果这个参数是NULL，则从当前的文件读取位置开始读取，并且读取之后更新文件的读取位置。如果这个参数不是NULL，则从指定的偏移量开始读取，不更新文件的读取位置。
+     3.fd_out: 这是输出文件描述符，数据将写入这个文件描述符。
+     4.off_out: 这是一个指向loff_t类型变量的指针，表示从输出文件的哪个偏移量开始写入数据。这个参数的行为和off_in类似。
+     5.len: 这是要移动的数据的长度。
+     6.flag：这是一个标志位集合，控制操作的具体行为
+     */
+ ​
+     if (ret == -1) {
+         return strerror(errno);
+     } else {
+         return NULL;
+     }
+ }
+ */
+ import "C"
+ ​
+ import (
+     "fmt"
+     "io"
+     "net/http"
+     "os"
+ )
+ ​
+ func main() {
+     http.HandleFunc("/splice", func(w http.ResponseWriter, r *http.Request) {
+         f, _ := os.Open("./hello.txt")
+         defer f.Close()
+ ​
+         // 创建一个管道
+         rfd, wfd, _ := os.Pipe()
+ ​
+         // 使用splice系统调用将数据从打开的文件移动到管道的写入端
+         errMsg := C.GoString(C.mysplice(C.int(f.Fd()), C.int(wfd.Fd()), 12))
+ ​
+         // 把写入端关闭
+         wfd.Close()
+ ​
+         if errMsg != "" {
+             fmt.Fprintf(os.Stderr, "mysplice: %s\n", errMsg)
+             return
+         }
+ ​
+         // 使用splice系统调用将数据从管道的读出端移动到http.ResponseWriter。http.ResponseWriter不能直接读取文件描述符。因此不能直接支持splice，因此必须通过io.Copy来间接使用。
+         io.Copy(w, rfd)
+ ​
+         // 读出端关闭
+         rfd.Close()
+     })
+ ​
+     http.ListenAndServe(":8080", nil)
+ }
+ ​
+数据拷贝过程
+示意图如下:
+
+
+
+
+image.png
+
+splice的系统调用方法如下:
+
+ func Splice(rfd int, roff *int64, wfd int, woff *int64, len int, flags int) (n int64, err error) 
+注意splice系统调用需要保证传入的文件描述符，rfd或者wfd至少一个是管道的文件描述符。创建管道也是一个系统调用，如下:
+
+ func Pipe2(p []int, flags int) error 
+再回到通过splice系统调用的情况，可以看到要调用两次splice系统调用，才能完成socket间的数据传递，因为splice系统调用会根据源文件描述符或目的文件描述符是管道的情况做不同的动作。
+
+第一次系统调用，目的文件描述符是管道，那么内核则会将管道和源文件描述符绑定在一起，注意此时是不会进行数据拷贝的。
+
+第二次splice系统调用，源文件描述符是管道，那么内核才会将管道内的数据拷贝到目的文件描述符，由于在前一次，管道已经和源文件描述符进行了绑定，所以这次的splice系统调用，实际上会将源文件描述符的数据拷贝到目的文件描述符。
+
+整个过程，抛开DMA技术拷贝的次数，一共只有一次数据拷贝的过程。
+
+golang标准库中 零拷贝应用举例--io.copy
+讲完了零拷贝涉及的技术，我们来看看golang是如何运用这些技术的。拿一个比较常用的方法举例，io.Copy, 其底层调用了copyBuffer方法，copyBuffer会判断copy的目的接口Writer是否实现了ReaderFrom 接口，如果实现了则直接调用ReaderFrom 从src读取数据。
+
+ func Copy(dst Writer, src Reader) (written int64, err error) {
+     return copyBuffer(dst, src, nil)
+ }
+ ​
+ func CopyBuffer(dst Writer, src Reader, buf []byte) (written int64, err error) {
+     if buf != nil && len(buf) == 0 {
+         panic("empty buffer in CopyBuffer")
+     }
+     return copyBuffer(dst, src, buf)
+ }
+ ​
+ func copyBuffer(dst Writer, src Reader, buf []byte) (written int64, err error) {
+     // If the reader has a WriteTo method, use it to do the copy.
+     // Avoids an allocation and a copy. 
+     // 如果写出支持WriteTo方法，那么就使用WriteTo方法。避免拷贝
+     if wt, ok := src.(WriterTo); ok {
+         return wt.WriteTo(dst)
+     }
+     // Similarly, if the writer has a ReadFrom method, use it to do the copy.
+     // 如果读入支持ReaderFrom方法，那么就使用ReaderFrom方法
+     if rt, ok := dst.(ReaderFrom); ok {
+         return rt.ReadFrom(src)
+     }
+     // 进行传统的文件读取，代码较长，暂时省略了。
+     .......
+     return written, err  
+ }
+net.TcpConn实现了ReadFrom 接口，拿net.TcpConn举例，看看它的实现。
+
+ func (c *TCPConn) readFrom(r io.Reader) (int64, error) {  
+    if n, err, handled := splice(c.fd, r); handled {  
+       return n, err  
+    }  
+    if n, err, handled := sendFile(c.fd, r); handled {  
+       return n, err  
+    }  
+    return genericReadFrom(c, r)  
+ }
+最终net.TcpConn 会调用readFrom方法从来源io.Reader读取数据，而readFrom读取数据用到的技术则是刚刚所讲的零拷贝技术，这里用到了splice和sendFile系统调用，如果来源io.Reader是一个tcp连接或者时unix 连接则会调用splice进行数据拷贝，否则就会调用sendFile进行数据拷贝。
+总结
+
+splice()、mmap() 和 sendfile() 都是用于处理数据传输的方法，每种方法都有其特定的用途和优点。尽管它们有一些功能上的重叠，但是每种方法在某些特定的情况下可能会更加高效或者更加适用。
+
+mmap(): 该函数可以将文件映射到进程的内存空间中，允许进程像操作内存一样操作文件。对于需要随机访问的大文件，或者需要在多个进程之间共享数据的情况，mmap() 可能会是一个很好的选择。
+sendfile(): 该函数允许在两个文件描述符之间直接传输数据，而无需通过用户空间。这对于某些网络应用（例如Web服务器）来说非常有用，它们需要将磁盘上的数据发送到网络套接字。
+splice(): 这是一个更通用的函数，它可以将数据从一个文件描述符移动到另一个文件描述符，也可以与管道一起使用。这使得 splice() 在处理某些流式数据传输任务时可以非常高效。
+总的来说，mmap(), sendfile(), 和 splice() 在处理不同类型的数据传输任务时，各有其优点和使用场景，它们都是Linux系统提供的强大工具。
