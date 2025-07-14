@@ -1,0 +1,39 @@
+strace 是一个强大的Linux 命令，用于跟踪程序执行时与内核的交互，包括系统调用、信号传递等。它能帮助开发者和系统管理员诊断、调试和理解程序的行为，而无需访问源代码。
+基本用法:
+跟踪程序执行:在命令前加上 strace 即可，例如：strace ls -l /etc 跟踪 ls -l /etc 命令的执行。
+跟踪正在运行的进程:使用 -p 选项和进程ID (PID) 来跟踪正在运行的进程，例如：strace -p 1234 跟踪PID 为1234 的进程。
+结束跟踪:按 Ctrl + C 即可停止跟踪。
+输出到文件:使用 -o 选项将跟踪结果输出到文件，例如：strace -o output.txt ls -l /etc。
+跟踪子进程:使用 -f 选项可以跟踪fork 出来的子进程。
+常用选项:
+-c:统计每个系统调用的执行次数、总耗时和错误次数。
+-o filename:将跟踪结果输出到指定文件。
+-p pid:跟踪指定进程ID。
+-f:跟踪目标进程以及其创建的所有子进程。﻿
+-e expr:过滤要跟踪的系统调用或信号，例如 -e trace=open,close 只跟踪open 和close 系统调用，-e signal=kill 只跟踪kill 信号。
+-s strsize:指定输出字符串的最大长度，默认是32。﻿
+-t:在每行输出前加上时间戳。
+-tt:在每行输出前加上毫秒级别的时间戳。
+-T:显示每个系统调用所花费的时间。
+-v:显示更详细的输出信息，例如完整的环境变量、stat 结构等。
+示例:
+跟踪 ping 命令:
+代码
+
+    strace ping google.com
+这将显示 ping 命令与内核交互的所有系统调用。
+跟踪某个进程并输出到文件:
+代码
+
+    strace -o process_trace.txt -p 1234
+将跟踪PID 为1234 的进程，并将结果保存到 process_trace.txt 文件中。
+统计 ls -l 命令的系统调用:
+代码
+
+    strace -c ls -l
+这将显示 ls -l 命令执行的每个系统调用的统计信息。
+只跟踪 open 和 close 系统调用:
+代码
+
+    strace -e trace=open,close ls -l
+strace 是一个功能强大的工具，熟练掌握它可以帮助你更好地理解和调试Linux 应用程序。更多高级用法，可以参考 strace 官方文档。
