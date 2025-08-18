@@ -676,3 +676,10 @@ func TestBenchEcho(t *testing.T) {
 	t.Logf("time elapsed: %s\n", time.Since(start))
 }
 
+服务器用 grpc.MaxConcurrentStreams(10) 限制并发流数。
+
+客户端发送 30 个并发请求。
+
+在 gRPC-Go 内部，handleSettings 会接收到 SettingMaxConcurrentStreams=10，客户端会更新 streamQuota。
+
+超过 10 的请求会被阻塞，等待流量 quota 可用。耗时3秒完成请求。
