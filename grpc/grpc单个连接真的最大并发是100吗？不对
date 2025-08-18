@@ -1,0 +1,568 @@
+测试代码
+服务端：
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"math/rand"
+	"time"
+
+	"github.com/95933447/grpcgateway/example/client/echo"
+	"github.com/995933447/microgosuit"
+	"github.com/995933447/microgosuit/discovery"
+	"github.com/995933447/microgosuit/grpcsuit"
+	"google.golang.org/grpc"
+)
+
+func main() {
+	err := microgosuit.InitSuitWithGrpc(context.TODO(), "../meta.json", "testschema", "test_discovery")
+	if err != nil {
+		panic(err)
+	}
+
+	err = microgosuit.ServeGrpc(context.TODO(), &microgosuit.ServeGrpcReq{
+		RegDiscoverKeyPrefix: "test_discovery",
+		SrvName:              "echo.Echo",
+		IpVar:                "$inner_ip",
+		Port:                 9111,
+		RegisterCustomServiceServerFunc: func(server *grpc.Server) error {
+			echo.RegisterEchoServer(server, &EchoService{})
+			return nil
+		},
+		AfterRegDiscover: func(discovery discovery.Discovery, node *discovery.Node) error {
+			fmt.Printf("======\nrun echo service success.\nhost:%s\nprot:%d\n======\n", node.Host, node.Port)
+			return nil
+		},
+	})
+	if err != nil {
+		panic(err)
+	}
+}
+
+type EchoService struct {
+	echo.UnimplementedEchoServer
+}
+
+func (s *EchoService) BasicEcho(ctx context.Context, req *echo.EchoReq) (*echo.EchoResp, error) {
+	var resp echo.EchoResp
+	time.Sleep(time.Second)
+	resp.Echo = req.Echo
+	return &resp, nil
+}
+
+func (s *EchoService) InnerEcho(ctx context.Context, req *echo.EchoReq) (*echo.EchoResp, error) {
+	return s.BasicEcho(ctx, req)
+}
+
+func (s *EchoService) NoAuthEcho(ctx context.Context, req *echo.EchoReq) (*echo.EchoResp, error) {
+	return s.BasicEcho(ctx, req)
+}
+
+func (s *EchoService) NoAuthEchoErr(ctx context.Context, req *echo.EchoReq) (*echo.EchoResp, error) {
+	r := rand.Intn(100)
+	if r > 50 {
+		return nil, errors.New("sys err")
+	}
+	return nil, grpcsuit.NewRpcErr(echo.ErrCode_ErrFail)
+}
+
+
+测试客户端代码:
+package main
+
+import (
+	"context"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/95933447/grpcgateway/example/client/echo"
+	"google.golang.org/grpc"
+)
+
+func TestBenchEcho(t *testing.T) {
+	conn, err := grpc.NewClient("192.168.2.225:9111", grpc.WithInsecure())
+	if err != nil {
+		panic(err)
+	}
+
+	start := time.Now()
+	var wg sync.WaitGroup
+	for i := 0; i < 10000; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err = echo.NewEchoClient(conn).BasicEcho(context.TODO(), &echo.EchoReq{
+				Echo: "hello world",
+			})
+			if err != nil {
+				panic(err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	// 10000并发 time elapsed: 1.188055666s 所以grpc的单个流的最大并发限制默认不是如网上所说的100
+	t.Logf("time elapsed: %s\n", time.Since(start))
+}
+
+（google.golang.org/grpc）服务端默认 SETTINGS_MAX_CONCURRENT_STREAMS 是 2¹⁶−1（65535）。
+👉 也就是说：
+
+并不是 100，而是 65535 个 stream 可以同时并发。
+
+所以 10000 个请求全部同时跑起来了。
+在 gRPC-Go 的实现里：
+
+服务端默认 grpc.MaxConcurrentStreams = math.MaxUint32 (≈ 4 billion)，但实际受 HTTP/2 规范限制，最终发给客户端的值是 65535。
+
+客户端只遵守服务端下发的 SETTINGS_MAX_CONCURRENT_STREAMS，并不会自己额外限制到 100。
+
+因此：
+
+每个请求 time.Sleep(1s) → 全部请求几乎同时开始、同时结束。
+
+结果就是 整体耗时 ≈ 1s。
+
+从源码看客户端设置了最大并发100，为什么不生效？
+客户端源码：
+// NewHTTP2Client constructs a connected ClientTransport to addr based on HTTP2
+// and starts to receive messages on it. Non-nil error returns if construction
+// fails.
+func NewHTTP2Client(connectCtx, ctx context.Context, addr resolver.Address, opts ConnectOptions, onClose func(GoAwayReason)) (_ ClientTransport, err error) {
+	scheme := "http"
+	ctx, cancel := context.WithCancel(ctx)
+	defer func() {
+		if err != nil {
+			cancel()
+		}
+	}()
+
+	// gRPC, resolver, balancer etc. can specify arbitrary data in the
+	// Attributes field of resolver.Address, which is shoved into connectCtx
+	// and passed to the dialer and credential handshaker. This makes it possible for
+	// address specific arbitrary data to reach custom dialers and credential handshakers.
+	connectCtx = icredentials.NewClientHandshakeInfoContext(connectCtx, credentials.ClientHandshakeInfo{Attributes: addr.Attributes})
+
+	conn, err := dial(connectCtx, opts.Dialer, addr, opts.UserAgent)
+	if err != nil {
+		if opts.FailOnNonTempDialError {
+			return nil, connectionErrorf(isTemporary(err), err, "transport: error while dialing: %v", err)
+		}
+		return nil, connectionErrorf(true, err, "transport: Error while dialing: %v", err)
+	}
+
+	// Any further errors will close the underlying connection
+	defer func(conn net.Conn) {
+		if err != nil {
+			conn.Close()
+		}
+	}(conn)
+
+	// The following defer and goroutine monitor the connectCtx for cancellation
+	// and deadline.  On context expiration, the connection is hard closed and
+	// this function will naturally fail as a result.  Otherwise, the defer
+	// waits for the goroutine to exit to prevent the context from being
+	// monitored (and to prevent the connection from ever being closed) after
+	// returning from this function.
+	ctxMonitorDone := grpcsync.NewEvent()
+	newClientCtx, newClientDone := context.WithCancel(connectCtx)
+	defer func() {
+		newClientDone()         // Awaken the goroutine below if connectCtx hasn't expired.
+		<-ctxMonitorDone.Done() // Wait for the goroutine below to exit.
+	}()
+	go func(conn net.Conn) {
+		defer ctxMonitorDone.Fire() // Signal this goroutine has exited.
+		<-newClientCtx.Done()       // Block until connectCtx expires or the defer above executes.
+		if err := connectCtx.Err(); err != nil {
+			// connectCtx expired before exiting the function.  Hard close the connection.
+			if logger.V(logLevel) {
+				logger.Infof("Aborting due to connect deadline expiring: %v", err)
+			}
+			conn.Close()
+		}
+	}(conn)
+
+	kp := opts.KeepaliveParams
+	// Validate keepalive parameters.
+	if kp.Time == 0 {
+		kp.Time = defaultClientKeepaliveTime
+	}
+	if kp.Timeout == 0 {
+		kp.Timeout = defaultClientKeepaliveTimeout
+	}
+	keepaliveEnabled := false
+	if kp.Time != infinity {
+		if err = isyscall.SetTCPUserTimeout(conn, kp.Timeout); err != nil {
+			return nil, connectionErrorf(false, err, "transport: failed to set TCP_USER_TIMEOUT: %v", err)
+		}
+		keepaliveEnabled = true
+	}
+	var (
+		isSecure bool
+		authInfo credentials.AuthInfo
+	)
+	transportCreds := opts.TransportCredentials
+	perRPCCreds := opts.PerRPCCredentials
+
+	if b := opts.CredsBundle; b != nil {
+		if t := b.TransportCredentials(); t != nil {
+			transportCreds = t
+		}
+		if t := b.PerRPCCredentials(); t != nil {
+			perRPCCreds = append(perRPCCreds, t)
+		}
+	}
+	if transportCreds != nil {
+		conn, authInfo, err = transportCreds.ClientHandshake(connectCtx, addr.ServerName, conn)
+		if err != nil {
+			return nil, connectionErrorf(isTemporary(err), err, "transport: authentication handshake failed: %v", err)
+		}
+		for _, cd := range perRPCCreds {
+			if cd.RequireTransportSecurity() {
+				if ci, ok := authInfo.(interface {
+					GetCommonAuthInfo() credentials.CommonAuthInfo
+				}); ok {
+					secLevel := ci.GetCommonAuthInfo().SecurityLevel
+					if secLevel != credentials.InvalidSecurityLevel && secLevel < credentials.PrivacyAndIntegrity {
+						return nil, connectionErrorf(true, nil, "transport: cannot send secure credentials on an insecure connection")
+					}
+				}
+			}
+		}
+		isSecure = true
+		if transportCreds.Info().SecurityProtocol == "tls" {
+			scheme = "https"
+		}
+	}
+	icwz := int32(initialWindowSize)
+	if opts.InitialConnWindowSize >= defaultWindowSize {
+		icwz = opts.InitialConnWindowSize
+	}
+	writeBufSize := opts.WriteBufferSize
+	readBufSize := opts.ReadBufferSize
+	maxHeaderListSize := defaultClientMaxHeaderListSize
+	if opts.MaxHeaderListSize != nil {
+		maxHeaderListSize = *opts.MaxHeaderListSize
+	}
+
+	t := &http2Client{
+		ctx:                   ctx,
+		ctxDone:               ctx.Done(), // Cache Done chan.
+		cancel:                cancel,
+		userAgent:             opts.UserAgent,
+		registeredCompressors: grpcutil.RegisteredCompressors(),
+		address:               addr,
+		conn:                  conn,
+		remoteAddr:            conn.RemoteAddr(),
+		localAddr:             conn.LocalAddr(),
+		authInfo:              authInfo,
+		readerDone:            make(chan struct{}),
+		writerDone:            make(chan struct{}),
+		goAway:                make(chan struct{}),
+		keepaliveDone:         make(chan struct{}),
+		framer:                newFramer(conn, writeBufSize, readBufSize, opts.SharedWriteBuffer, maxHeaderListSize),
+		fc:                    &trInFlow{limit: uint32(icwz)},
+		scheme:                scheme,
+		activeStreams:         make(map[uint32]*ClientStream),
+		isSecure:              isSecure,
+		perRPCCreds:           perRPCCreds,
+		kp:                    kp,
+		statsHandlers:         opts.StatsHandlers,
+		initialWindowSize:     initialWindowSize,
+		nextID:                1,
+		maxConcurrentStreams:  defaultMaxStreamsClient,
+		streamQuota:           defaultMaxStreamsClient,
+		streamsQuotaAvailable: make(chan struct{}, 1),
+		keepaliveEnabled:      keepaliveEnabled,
+		bufferPool:            opts.BufferPool,
+		onClose:               onClose,
+	}
+	var czSecurity credentials.ChannelzSecurityValue
+	if au, ok := authInfo.(credentials.ChannelzSecurityInfo); ok {
+		czSecurity = au.GetSecurityValue()
+	}
+	t.channelz = channelz.RegisterSocket(
+		&channelz.Socket{
+			SocketType:       channelz.SocketTypeNormal,
+			Parent:           opts.ChannelzParent,
+			SocketMetrics:    channelz.SocketMetrics{},
+			EphemeralMetrics: t.socketMetrics,
+			LocalAddr:        t.localAddr,
+			RemoteAddr:       t.remoteAddr,
+			SocketOptions:    channelz.GetSocketOption(t.conn),
+			Security:         czSecurity,
+		})
+	t.logger = prefixLoggerForClientTransport(t)
+	// Add peer information to the http2client context.
+	t.ctx = peer.NewContext(t.ctx, t.getPeer())
+
+	if md, ok := addr.Metadata.(*metadata.MD); ok {
+		t.md = *md
+	} else if md := imetadata.Get(addr); md != nil {
+		t.md = md
+	}
+	t.controlBuf = newControlBuffer(t.ctxDone)
+	if opts.InitialWindowSize >= defaultWindowSize {
+		t.initialWindowSize = opts.InitialWindowSize
+	}
+	if !opts.StaticWindowSize {
+		t.bdpEst = &bdpEstimator{
+			bdp:               initialWindowSize,
+			updateFlowControl: t.updateFlowControl,
+		}
+	}
+	for _, sh := range t.statsHandlers {
+		t.ctx = sh.TagConn(t.ctx, &stats.ConnTagInfo{
+			RemoteAddr: t.remoteAddr,
+			LocalAddr:  t.localAddr,
+		})
+		connBegin := &stats.ConnBegin{
+			Client: true,
+		}
+		sh.HandleConn(t.ctx, connBegin)
+	}
+	if t.keepaliveEnabled {
+		t.kpDormancyCond = sync.NewCond(&t.mu)
+		go t.keepalive()
+	}
+
+	// Start the reader goroutine for incoming messages. Each transport has a
+	// dedicated goroutine which reads HTTP2 frames from the network. Then it
+	// dispatches the frame to the corresponding stream entity.  When the
+	// server preface is received, readerErrCh is closed.  If an error occurs
+	// first, an error is pushed to the channel.  This must be checked before
+	// returning from this function.
+	readerErrCh := make(chan error, 1)
+	go t.reader(readerErrCh)
+	defer func() {
+		if err != nil {
+			// writerDone should be closed since the loopy goroutine
+			// wouldn't have started in the case this function returns an error.
+			close(t.writerDone)
+			t.Close(err)
+		}
+	}()
+
+	// Send connection preface to server.
+	n, err := t.conn.Write(clientPreface)
+	if err != nil {
+		err = connectionErrorf(true, err, "transport: failed to write client preface: %v", err)
+		return nil, err
+	}
+	if n != len(clientPreface) {
+		err = connectionErrorf(true, nil, "transport: preface mismatch, wrote %d bytes; want %d", n, len(clientPreface))
+		return nil, err
+	}
+	var ss []http2.Setting
+
+	if t.initialWindowSize != defaultWindowSize {
+		ss = append(ss, http2.Setting{
+			ID:  http2.SettingInitialWindowSize,
+			Val: uint32(t.initialWindowSize),
+		})
+	}
+	if opts.MaxHeaderListSize != nil {
+		ss = append(ss, http2.Setting{
+			ID:  http2.SettingMaxHeaderListSize,
+			Val: *opts.MaxHeaderListSize,
+		})
+	}
+	err = t.framer.fr.WriteSettings(ss...)
+	if err != nil {
+		err = connectionErrorf(true, err, "transport: failed to write initial settings frame: %v", err)
+		return nil, err
+	}
+	// Adjust the connection flow control window if needed.
+	if delta := uint32(icwz - defaultWindowSize); delta > 0 {
+		if err := t.framer.fr.WriteWindowUpdate(0, delta); err != nil {
+			err = connectionErrorf(true, err, "transport: failed to write window update: %v", err)
+			return nil, err
+		}
+	}
+
+	t.connectionID = atomic.AddUint64(&clientConnectionCounter, 1)
+
+	if err := t.framer.writer.Flush(); err != nil {
+		return nil, err
+	}
+	// Block until the server preface is received successfully or an error occurs.
+	if err = <-readerErrCh; err != nil {
+		return nil, err
+	}
+	go func() {
+		t.loopy = newLoopyWriter(clientSide, t.framer, t.controlBuf, t.bdpEst, t.conn, t.logger, t.outgoingGoAwayHandler, t.bufferPool)
+		if err := t.loopy.run(); !isIOError(err) {
+			// Immediately close the connection, as the loopy writer returns
+			// when there are no more active streams and we were draining (the
+			// server sent a GOAWAY).  For I/O errors, the reader will hit it
+			// after draining any remaining incoming data.
+			t.conn.Close()
+		}
+		close(t.writerDone)
+	}()
+	return t, nil
+}这段代码是否说明客户端会自己控制并发数量	defaultMaxStreamsClient       = 100
+
+真相：
+
+1. 代码里的 defaultMaxStreamsClient = 100
+在 gRPC-Go (transport/http2_client.go) 确实定义了这个常量：
+
+go
+
+const defaultMaxStreamsClient = 100
+在你贴的 NewHTTP2Client 里，它被赋值给：
+
+go
+
+maxConcurrentStreams:  defaultMaxStreamsClient,
+streamQuota:           defaultMaxStreamsClient,
+这看上去像是“客户端自己默认最多只能并发 100 个 stream”。
+
+2. 实际运行时会发生什么？
+注意：这只是 初始值，并不是最终值。
+
+当客户端完成 HTTP/2 SETTINGS 交换 之后，服务端会告诉客户端：
+SETTINGS_MAX_CONCURRENT_STREAMS = N
+
+在 gRPC-Go 的 reader goroutine 里，当收到 SETTINGS 帧时，会更新：
+
+go
+t.maxConcurrentStreams = srvSettings.MaxConcurrentStreams
+t.streamQuota = srvSettings.MaxConcurrentStreams
+所以：
+
+在连接刚建立，还没收到服务端 SETTINGS 之前，客户端只能开 100 个 stream。
+
+一旦收到服务端的设置，就会覆盖这个值。
+
+gRPC-Go 服务端默认下发的是 math.MaxUint32 ≈ 4e9，但是会被 HTTP/2 协议规范限制在 2^31-1，所以常见值是 65535。
+
+3. 结合实验
+客户端起了 10000 个并发请求，一次就全跑完了，耗时 1s。
+说明：
+
+客户端在建立连接后已经收到了服务端的 SETTINGS。
+
+服务端默认值很大（65535），所以客户端放开了限制。
+
+defaultMaxStreamsClient = 100 的影响只存在于「刚连上、没握手完」的那一瞬间。你测的时候已经过了这一步，所以 100 并没有起作用。
+
+4. 结论
+客户端确实有默认并发上限 100，但只是 临时的 bootstrap 值。
+
+真正决定并发上限的是 服务端发下来的 SETTINGS_MAX_CONCURRENT_STREAMS。
+
+gRPC-Go 服务端默认给客户端的是一个巨大的数（65535），所以你能并发 300 甚至更多。
+
+✅ 总结
+你看到的 defaultMaxStreamsClient = 100 并不是客户端的硬限制，而是「握手完成前的占位值」。
+最终上限取决于服务端 —— gRPC-Go 服务端默认下发 65535，所以你实验里没有被卡住。
+
+具体代码在这：
+func (t *http2Client) handleSettings(f *http2.SettingsFrame, isFirst bool) {
+	if f.IsAck() {
+		return
+	}
+	var maxStreams *uint32
+	var ss []http2.Setting
+	var updateFuncs []func()
+	f.ForeachSetting(func(s http2.Setting) error {
+		switch s.ID {
+		case http2.SettingMaxConcurrentStreams:
+			maxStreams = new(uint32)
+			*maxStreams = s.Val
+		case http2.SettingMaxHeaderListSize:
+			updateFuncs = append(updateFuncs, func() {
+				t.maxSendHeaderListSize = new(uint32)
+				*t.maxSendHeaderListSize = s.Val
+			})
+		default:
+			ss = append(ss, s)
+		}
+		return nil
+	})
+	if isFirst && maxStreams == nil {
+		maxStreams = new(uint32)
+		*maxStreams = math.MaxUint32
+	}
+	sf := &incomingSettings{
+		ss: ss,
+	}
+	if maxStreams != nil {
+		updateStreamQuota := func() {
+			delta := int64(*maxStreams) - int64(t.maxConcurrentStreams)
+			t.maxConcurrentStreams = *maxStreams
+			t.streamQuota += delta
+			if delta > 0 && t.waitingStreams > 0 {
+				close(t.streamsQuotaAvailable) // wake all of them up.
+				t.streamsQuotaAvailable = make(chan struct{}, 1)
+			}
+		}
+		updateFuncs = append(updateFuncs, updateStreamQuota)
+	}
+	t.controlBuf.executeAndPut(func() bool {
+		for _, f := range updateFuncs {
+			f()
+		}
+		return true
+	}, sf)
+}
+
+
+这段 handleSettings 正是 客户端更新并发上限 的核心逻辑。我们拆一下：
+
+1. 关键点：http2.SettingMaxConcurrentStreams
+go
+
+f.ForeachSetting(func(s http2.Setting) error {
+    switch s.ID {
+    case http2.SettingMaxConcurrentStreams:
+        maxStreams = new(uint32)
+        *maxStreams = s.Val
+这里会捕获服务端下发的 SETTINGS_MAX_CONCURRENT_STREAMS 值。
+
+2. 如果是第一个 SETTINGS，且服务端没显式给值
+go
+
+if isFirst && maxStreams == nil {
+    maxStreams = new(uint32)
+    *maxStreams = math.MaxUint32
+}
+📌 这说明：
+
+第一次握手如果服务端没告诉客户端并发上限，那客户端就假设 无限大 (2^32-1)。
+
+这也解释了为什么你实验里能轻松超过 100 —— gRPC-Go 服务端默认不会下发限制。
+
+3. 更新并发控制
+go
+updateStreamQuota := func() {
+    delta := int64(*maxStreams) - int64(t.maxConcurrentStreams)
+    t.maxConcurrentStreams = *maxStreams
+    t.streamQuota += delta
+    if delta > 0 && t.waitingStreams > 0 {
+        close(t.streamsQuotaAvailable) // wake all of them up.
+        t.streamsQuotaAvailable = make(chan struct{}, 1)
+    }
+}
+t.maxConcurrentStreams：更新为新的最大并发。
+
+t.streamQuota：增加可用的 stream 配额。
+
+如果有等待中的 stream，就被唤醒。
+
+4. 结合前面你贴的 defaultMaxStreamsClient = 100
+连接刚建立时，客户端用 临时值 100 限制并发。
+
+一旦收到服务端 SETTINGS，这里的逻辑会立刻覆盖它。
+
+如果服务端不发 SETTINGS_MAX_CONCURRENT_STREAMS，就走默认的 math.MaxUint32（几乎无限）。
+
+✅ 结论
+是的，就是这段代码控制了 gRPC 客户端最终能开的并发数。
+defaultMaxStreamsClient = 100 只是初始 bootstrap 值，握手后会被这里替换掉，所以你的实验才能超过 100。
+
