@@ -566,3 +566,113 @@ t.streamQuota：增加可用的 stream 配额。
 是的，就是这段代码控制了 gRPC 客户端最终能开的并发数。
 defaultMaxStreamsClient = 100 只是初始 bootstrap 值，握手后会被这里替换掉，所以你的实验才能超过 100。
 
+验证代码:
+服务端：
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"math/rand"
+	"time"
+
+	"github.com/95933447/grpcgateway/example/client/echo"
+	"github.com/995933447/microgosuit"
+	"github.com/995933447/microgosuit/discovery"
+	"github.com/995933447/microgosuit/grpcsuit"
+	"google.golang.org/grpc"
+)
+
+func main() {
+	err := microgosuit.InitSuitWithGrpc(context.TODO(), "../meta.json", "testschema", "test_discovery")
+	if err != nil {
+		panic(err)
+	}
+
+	err = microgosuit.ServeGrpc(context.TODO(), &microgosuit.ServeGrpcReq{
+		RegDiscoverKeyPrefix: "test_discovery",
+		SrvName:              "echo.Echo",
+		IpVar:                "$inner_ip",
+		Port:                 9111,
+		SrvOpts:              []grpc.ServerOption{grpc.MaxConcurrentStreams(10)}, // 服务器限制最大并发流数
+		RegisterCustomServiceServerFunc: func(server *grpc.Server) error {
+			echo.RegisterEchoServer(server, &EchoService{})
+			return nil
+		},
+		AfterRegDiscover: func(discovery discovery.Discovery, node *discovery.Node) error {
+			fmt.Printf("======\nrun echo service success.\nhost:%s\nprot:%d\n======\n", node.Host, node.Port)
+			return nil
+		},
+	})
+	if err != nil {
+		panic(err)
+	}
+}
+
+type EchoService struct {
+	echo.UnimplementedEchoServer
+}
+
+func (s *EchoService) BasicEcho(ctx context.Context, req *echo.EchoReq) (*echo.EchoResp, error) {
+	var resp echo.EchoResp
+	time.Sleep(time.Second)
+	resp.Echo = req.Echo
+	return &resp, nil
+}
+
+func (s *EchoService) InnerEcho(ctx context.Context, req *echo.EchoReq) (*echo.EchoResp, error) {
+	return s.BasicEcho(ctx, req)
+}
+
+func (s *EchoService) NoAuthEcho(ctx context.Context, req *echo.EchoReq) (*echo.EchoResp, error) {
+	return s.BasicEcho(ctx, req)
+}
+
+func (s *EchoService) NoAuthEchoErr(ctx context.Context, req *echo.EchoReq) (*echo.EchoResp, error) {
+	r := rand.Intn(100)
+	if r > 50 {
+		return nil, errors.New("sys err")
+	}
+	return nil, grpcsuit.NewRpcErr(echo.ErrCode_ErrFail)
+}
+
+客户端：
+package main
+
+import (
+	"context"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/95933447/grpcgateway/example/client/echo"
+	"google.golang.org/grpc"
+)
+
+func TestBenchEcho(t *testing.T) {
+	conn, err := grpc.NewClient("192.168.2.225:9111", grpc.WithInsecure())
+	if err != nil {
+		panic(err)
+	}
+
+	start := time.Now()
+	var wg sync.WaitGroup
+	for i := 0; i < 30; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err = echo.NewEchoClient(conn).BasicEcho(context.TODO(), &echo.EchoReq{
+				Echo: "hello world",
+			})
+			if err != nil {
+				panic(err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	// echo_bench_test.go:36: time elapsed: 3.004762791s
+	t.Logf("time elapsed: %s\n", time.Since(start))
+}
+
