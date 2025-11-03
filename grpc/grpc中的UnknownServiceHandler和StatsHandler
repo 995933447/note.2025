@@ -1,0 +1,221 @@
+一、UnknownServiceHandler
+handler，顾名思义就是处理器，UnknownServiceHandler就是服务未找到的处理器
+
+什么时候服务会未找到？
+
+举例：
+
+server := grpc.NewServer()
+// 将此处注释后，表示服务端没有注册helloService服务
+//helloService := new(service.HelloService)
+//hello.RegisterHelloServiceServer(server,helloService)
+这时，如果有客户端请求这个helloService服务，就会产生rpc error
+
+rpc error: code = Unimplemented desc = unknown service hello.HelloService
+UnknownServiceHandler就是grpc官方提供给我们的一种处理方式，让我们可以灵活的处理这种情况出现
+
+1.1 定义UnknownServiceHandler
+
+package handler
+
+import (
+	"fmt"
+	"google.golang.org/grpc"
+	"net/http"
+	"sgrpc/grpc/proto/hello"
+)
+
+func UnknownServiceHandler(srv interface{}, stream grpc.ServerStream) error{
+
+	fmt.Println("服务未找到...")
+	resp := &hello.HelloResponse{
+		Code: http.StatusOK,
+		Msg: "not found",
+	}
+	
+	err := stream.SendMsg(resp)
+	if err != nil {
+		fmt.Println(err)
+		return err
+	}
+	return nil
+}
+1.2 注册UnknownServiceHandler
+
+server := grpc.NewServer(grpc.UnknownServiceHandler(handler.UnknownServiceHandler))
+这时，如果客户端再次访问，将正常返回
+
+code:200 msg:"not found"
+二、StatsHandler
+StatsHandler，顾名思义就是状态处理器，具体是什么的状态？查看grpc源码，StatsHandler其实是一个接口，它提供了一些方法，根据方法的描述，我们可以知道它是对连接状态的处理器
+
+// Handler defines the interface for the related stats handling (e.g., RPCs, connections).
+type Handler interface {
+	// TagRPC can attach some information to the given context.
+	// The context used for the rest lifetime of the RPC will be derived from
+	// the returned context.
+	TagRPC(context.Context, *RPCTagInfo) context.Context
+	// HandleRPC processes the RPC stats.
+	HandleRPC(context.Context, RPCStats)
+
+	// TagConn can attach some information to the given context.
+	// The returned context will be used for stats handling.
+	// For conn stats handling, the context used in HandleConn for this
+	// connection will be derived from the context returned.
+	// For RPC stats handling,
+	//  - On server side, the context used in HandleRPC for all RPCs on this
+	// connection will be derived from the context returned.
+	//  - On client side, the context is not derived from the context returned.
+	TagConn(context.Context, *ConnTagInfo) context.Context
+	// HandleConn processes the Conn stats.
+	HandleConn(context.Context, ConnStats)
+}
+虽然我们不知道有哪些状态，以及里面的函数具体的作用，但是我们可以先实现它并打印信息
+
+2.1 定义StatsHandler
+
+package handler
+
+import (
+	"context"
+	"fmt"
+	"google.golang.org/grpc/stats"
+)
+
+type StatsHandler struct {
+	
+}
+
+//TagConn可以将一些信息附加到给定的上下文。
+func (h *StatsHandler) TagConn(ctx context.Context, info *stats.ConnTagInfo) context.Context {
+	fmt.Println("tagConn...")
+	return ctx
+}
+
+// 会在连接开始和结束时被调用，分别会输入不同的状态.
+
+func (h *StatsHandler) HandleConn(ctx context.Context, s stats.ConnStats) {
+	fmt.Println("handleConn...")
+}
+
+
+// TagRPC可以将一些信息附加到给定的上下文
+
+func (h *StatsHandler) TagRPC(ctx context.Context, info *stats.RPCTagInfo) context.Context {
+	fmt.Println("tagrpc...")
+
+	return ctx
+}
+
+// 处理RPC统计信息
+func (h *StatsHandler) HandleRPC(ctx context.Context, s stats.RPCStats) {
+	fmt.Println("handleRPC...")
+}
+2.2 注册StatsHandler
+
+server := grpc.NewServer(grpc.StatsHandler(&handler.StatsHandler{}),grpc.UnknownServiceHandler(handler.UnknownServiceHandler))
+2.3 测试
+
+启动服务端，客户端连接后多次调用服务
+
+for i :=0;i<2;i++{
+	time.Sleep(2 * time.Second)
+	err = SayHello(helloServiceClient) // 一元
+	if err != nil {
+		fmt.Println(err)
+	}
+}
+打印结果：
+
+tagConn...
+handleConn...
+
+tagrpc...
+handleRPC...
+handleRPC...
+handleRPC...
+say hello
+handleRPC...
+handleRPC...
+handleRPC...
+handleRPC...
+
+tagrpc...
+handleRPC...
+handleRPC...
+handleRPC...
+say hello
+handleRPC...
+handleRPC...
+handleRPC...
+handleRPC...
+
+handleConn...
+根据结果我们可以大胆得出这样的结论：tagConn在客户端连接时（grpc.Dial）会调用一次，handleConn在连接后会调用一次，在关闭连接时也会调用一次，tagrpc在调用具体的方法服务时会调用一次SayHello(helloServiceClient)，handleRPC在每次调用服务时会调用6次，而且是调用前三次，调用结束后四次，查看handlerRPC入参可以发现确实有七种状态
+
+
+因此，我们可以根据switch判断：
+
+package handler
+
+import (
+	"context"
+	"fmt"
+	"google.golang.org/grpc/stats"
+	"log"
+)
+
+type StatsHandler struct {
+	
+}
+
+//TagConn可以将一些信息附加到给定的上下文。
+func (h *StatsHandler) TagConn(ctx context.Context, info *stats.ConnTagInfo) context.Context {
+	fmt.Println("tagConn...")
+	return ctx
+}
+
+// 会在连接开始和结束时被调用，分别会输入不同的状态.
+
+func (h *StatsHandler) HandleConn(ctx context.Context, s stats.ConnStats) {
+	// 开始和结束状态
+	switch s.(type) {
+	case *stats.ConnBegin:
+		log.Printf("begin conn")
+	case *stats.ConnEnd:
+		log.Printf("end conn")
+	default:
+		fmt.Println("handleConn...")
+	}
+}
+
+
+// TagRPC可以将一些信息附加到给定的上下文
+
+func (h *StatsHandler) TagRPC(ctx context.Context, info *stats.RPCTagInfo) context.Context {
+	fmt.Println("tagrpc...@"+info.FullMethodName)
+	return ctx
+}
+
+// 处理RPC统计信息
+func (h *StatsHandler) HandleRPC(ctx context.Context, s stats.RPCStats) {
+	switch s.(type) {
+	case *stats.Begin:
+		fmt.Println("handlerRPC begin...")
+	case *stats.End:
+		fmt.Println("handlerRPC End...")
+	case *stats.InHeader:
+		fmt.Println("handlerRPC InHeader...")
+	case *stats.InPayload:
+		fmt.Println("handlerRPC InPayload...")
+	case *stats.InTrailer:
+		fmt.Println("handlerRPC InTrailer...")
+	case *stats.OutHeader:
+		fmt.Println("handlerRPC OutHeader...")
+	case *stats.OutPayload:
+		fmt.Println("handlerRPC OutPayload...")
+	default:
+		fmt.Println("handleRPC...")
+	}
+}
+每种状态代表什么？代表顾名思义.....
