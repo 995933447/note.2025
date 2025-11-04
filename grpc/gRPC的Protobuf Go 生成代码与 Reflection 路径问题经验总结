@@ -1,0 +1,97 @@
+最近在用 Go 的 gRPC reflection 调试时遇到一个坑，分享一下经验，希望能帮到遇到类似问题的同学。
+
+问题复现
+
+
+
+我有一个 echo.proto，里面 import 了 mgorm/ext.proto：
+
+import "mgorm/ext.proto";
+
+service Echo {
+  rpc BasicEcho(EchoReq) returns (EchoResp);
+}
+
+
+
+
+生成 Go 代码时，使用：
+
+protoc --go_out=. --go-grpc_out=. ./proto/echo.proto
+
+
+
+
+生成的 echo.pb.go 里面有一行：
+
+import _ "github.com/995933447/mgorm/pb"
+
+
+
+
+本意是为了注册 ext.proto 的 FileDescriptor，但实际情况是：
+
+我本地有 ./proto/mgorm/ext.proto
+但 import 的包 _ "github.com/995933447/mgorm/pb" 对应的是 第三方仓库里的 proto 文件，路径为 "github.com/995933447/mgorm/proto/ext.proto"
+
+
+
+于是，当我用 reflection 调用服务：
+
+rpcSvcDesc, err := cli.ResolveService("echo.Echo")
+
+
+
+
+报错：
+
+Service not found: echo.Echo
+caused by: File not found: mgorm/ext.proto
+
+根本原因分析
+gRPC reflection 依赖 FileDescriptor 注册的路径，不是文件系统路径。
+echo.pb.go import 的 _ "github.com/995933447/mgorm/pb" 注册了第三方 proto 的 FileDescriptor，路径是 "github.com/995933447/mgorm/proto/ext.proto"。
+echo.proto 里 import "mgorm/ext.proto"，reflection 查找注册时匹配不上 → 找不到 service。
+
+
+
+也就是说，Go 包 import 路径和 proto 文件 import 路径必须一致，否则 reflection 无法正确找到服务。
+
+解决方法
+
+
+
+修改 ext.proto 的 go_package 为本地项目路径：
+
+option go_package = "github.com/995933447/easymicro/example/ext/mgorm";
+
+
+
+
+重新生成 pb 文件：
+
+protoc --go_out=. --go-grpc_out=. ./proto/echo.proto
+
+
+
+
+生成的 echo.pb.go import 的路径就和本地 proto 对应：
+
+import _ "github.com/995933447/easymicro/example/ext/mgorm"
+
+reflection 可以正确找到 "mgorm/ext.proto" 的 FileDescriptor
+Service not found 错误消失
+总结经验
+Go pb 生成文件里 import 的包路径必须和 proto import 路径一致。
+使用第三方 pb 包注册 FileDescriptor 时，要确认路径是否匹配本地 proto，否则 reflection 会报 File not found。
+reflection 查找依赖 proto 文件，是根据 pb 文件注册的 FileDescriptor 名称，而不是文件系统路径。
+最保险做法：proto 文件的 option go_package 对应本地项目路径，生成的 pb 文件和实际 import 路径一致。
+
+
+
+通过这次经历，我理解了 reflection 的工作机制，也解决了一个在多模块 Go 项目中容易踩的坑：import 路径与 proto 文件实际位置不一致。
+
+
+
+
+这个问题在动态调用 RPC 或者用 gRPC 网关时尤其容易遇到，希望记录下来方便自己和他人参考。
