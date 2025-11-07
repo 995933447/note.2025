@@ -1,0 +1,333 @@
+
+首先介绍一下JSON Schema ，它是用于验证 JSON 数据结构的强大工具，JSON Schema是以一个JSON串来描述的JSON数据规范，可以用JSON Schema检验一个给定的JSON串是否满足约定的数据规范。目前工作中的http接口的输入输出多数都是JSON格式的数据，校验数据格式是否满足约定是必不可少的，无论是业务代码中对输入数据进行校验，还是测试用例中对接口输出数据做校验，都可以通过JSON Schema完成。下面通过几个例子看看JSON Schema到底是个啥。
+
+例子1：最简单的JSON Schema就是没有限制
+虽然我们使用JSON Schema 的目的是对JSON格式的数据做种种限制和校验，但空对象是完全有效的模式，可以接受任何有效的JSON。
+
+{}
+
+下面这些都是有效的数据
+
+31
+
+"I'm a string"
+
+{ "an": [ "arbitrarily", "nested" ], "data": "structure" }
+例子2： JSON Schema的限制条件
+为JSON Schema加几个限制条件，看看下面这个JSON Schema是如何约定JSON数据的
+
+{
+	"type": "object",
+	"properties": {
+		"number": {
+			"type": "number"
+		},
+		"street_name": {
+			"type": "string"
+		},
+		"street_type": {
+			"type": "string",
+			"enum": ["Street", "Avenue", "Boulevard"]
+		}
+	},
+	"required": ["number", "street_name"]
+}
+type关键字表示JSON 限定类型是object，每个属性的type表示这个属性的数据类型
+properties关键字指定这个object有三个属性number,street_name,street_type,
+enum关键字表示这个street_type的数据只能是"Street", "Avenue", "Boulevard"这三个值
+required 表示number,street_name是必须有的属性，默认情况下，由properties关键字定义的属性不是必需的。
+可以校验通过的数据
+{
+	"number": 1600,
+	"street_name": "Pennsylvania",
+	"street_type": "Avenue"
+}
+{
+	"number": 1600,
+	"street_name": "Pennsylvania"
+}
+ 
+
+不能校验通过的数据
+ 
+
+缺少必须属性
+
+{ "number": 1600 }
+
+ 
+
+street_type使用的值“super-speed”不是在JSON Schema中约定的枚举值
+
+{
+	"number": 1600,
+	"street_name": "Pennsylvania",
+	"street_type": "super-speed"
+}
+关键字介绍
+JSON Schema通过关键字描述对JSON数据的限制条件，下面再介绍几个关键字进一步了解JSON Schema 的功能。
+
+ 
+
+1. 用来定义基本功能的关键字
+$schema: 这个关键字是JSON Schema的方言标识符，用于声明schema使用的是哪个draft版本。
+
+{ "$schema": "json-schema.org/draft-07/sc… }
+
+ 
+
+$id: 声明一个模式资源标识
+
+{ "$id":"yourdomain.com/schemas/you…
+
+ 
+
+type: 声明数据类型，可选的内容包括：
+
+string
+number （整数、浮点数）
+integer （整数）
+object
+array
+boolean
+null
+2. 用于string类型验证的关键字
+可以用下面这些关键字去限制string类型的数据
+
+minLength，字符串最小长度，非负数
+maxLength，字符串最大长度，非负数
+pattern，正则表达式
+{ "type":"string", "maxLength":10 }
+
+ 
+
+3. 用于Number类型验证的关键字
+maximum: 限定最大值小于等于给定的值
+minimum: 限定最小值大于等于给定的值
+exclusiveMaximum: 限定最大值小于给定的值
+exclusiveMinimum: 限定最小值大于给定的值
+multipleOf: 限制数据为给定数字的倍数。
+下面例子约定值是10的倍数都可以校验通过。
+
+{ "type":"number", "multipleOf":10 }
+
+ 
+
+4. 用于Array类型验证的关键字
+数组类型的限制分为两种：items模式和contains模式
+items模式：任意长度的序列，其中每个项目都匹配相同的模式。
+
+{
+  "type": "array",
+  "minItems": 2,
+  "maxItems": 3
+}
+
+{
+  "type": "array",
+  "uniqueItems": true
+}
+minItems: 限定数组长度大于等于给定的值
+maxItems: 限定数组长度小于等于给定的值
+uniqueItems: 限定数组中元素是唯一的
+ 
+
+contains模式只需要针对数组中的一个或多个项目进行验证。
+
+{
+  "type": "array",
+  "contains": {
+    "type": "number"
+  },
+  "minContains": 2,
+  "maxContains": 3
+}
+minContains: 限定最少匹配contains的次数
+maxContains: 限定最多匹配contains的次数
+ 
+
+验证失败的数据
+
+["apple", "orange", 2]
+["apple", "orange", 2, 4, 8, 16]
+
+验证通过的数据
+
+["apple", "orange", 2, 4]
+["apple", "orange", 2, 4, 8]number还可以使用multipleOf关键字将数字限制为给定数字的倍数。它可以被设置为任何正数。
+
+5. 用于Object类型验证的关键字
+{
+  "type": "object",
+  "properties": {
+    "name": { "type": "string" },
+    "email": { "type": "string" },
+    "address": { "type": "string" },
+    "telephone": { "type": "string" }
+  },
+  "required": ["name", "email"]
+}
+{
+  "type": "object",
+  "minProperties": 2,
+  "maxProperties": 3
+}
+
+minProperties: 限定最小属性个数
+maxProperties: 限定最大属性个数
+required: 必须有得属性
+properties: 用来配置对象属性
+ 
+
+Java中利用JSON Schema校验数据
+下面我们用一个简单的例子演示一下JSON Schema在java程序中校验数据
+
+首先配置依赖
+jsonschema-generator是一个根据java object生成JSON Schema的工具，支持Draft 6, 7, 2019-09， 2020-12
+everit-json-schema是官方推荐的一个校验工具
+        <dependency>
+            <groupId>com.github.victools</groupId>
+            <artifactId>jsonschema-generator</artifactId>
+            <version>4.31.0</version>
+        </dependency>
+		<dependency>
+            <groupId>com.github.erosb</groupId>
+            <artifactId>everit-json-schema</artifactId>
+            <version>1.14.2</version>
+        </dependency>
+再准备一个JSON Schema
+约定输入的JSON数据的目的实际是要用这个数据转化成java对象，所以我们用一个java对象生成一个JSON Schema
+
+public class Person {
+    private String name;
+    private int idNumber;
+    private int phoneNumber;
+    private List<String> qualifications;
+    private Address address;
+    private Gender gender;
+}
+
+public class Address {
+    private String firstLine;
+    private String secondLine;
+    private String thirdLine;
+}
+
+public enum Gender {
+    male,female
+}
+
+public void schemaGenerator() {
+    SchemaGeneratorConfigBuilder configBuilder = new SchemaGeneratorConfigBuilder(SchemaVersion.DRAFT_7, OptionPreset.PLAIN_JSON);
+    SchemaGeneratorConfig config = configBuilder.build();
+    SchemaGenerator generator = new SchemaGenerator(config);
+    JsonNode jsonSchema = generator.generateSchema(Person.class);
+
+    System.out.println(jsonSchema.toPrettyString());
+}
+ 
+
+这样我们就获得了一个JSON Schema
+
+{
+  "$schema" : "<http://json-schema.org/draft-07/schema#",>
+  "type" : "object",
+  "properties" : {
+    "address" : {
+      "type" : "object",
+      "properties" : {
+        "firstLine" : {
+          "type" : "string"
+        },
+        "secondLine" : {
+          "type" : "string"
+        },
+        "thirdLine" : {
+          "type" : "string"
+        }
+      }
+    },
+    "qualifications" : {
+      "type" : "array",
+      "items" : {
+        "type" : "string"
+      }
+    },
+    "gender" : {
+      "type" : "string",
+      "enum" : [ "male", "female" ]
+    },
+    "idNumber" : {
+      "type" : "integer"
+    },
+    "name" : {
+      "type" : "string"
+    },
+    "phoneNumber" : {
+      "type" : "integer"
+    }
+  }
+}
+ 
+
+接下来我们准备一个用于验证的JSON数据，这是一个不符合JSON Schema约定的数据
+
+{
+  "name": "tom",
+  "idNumber": 0,
+  "phoneNumber": 0,
+  "qualifications": null,
+  "address": {
+    "firstLine": "beijing",
+    "secondLine": null,
+    "thirdLine": null
+  },
+  "gender": null
+}
+ 
+
+校验数据
+
+    @Test
+    public void validateDraft7Demo(){
+        String schemaJsonString = getJsonString("schema2.json");
+        String data = getJsonString("person.json");
+        SchemaLoader loader = SchemaLoader.builder()
+                .schemaJson(new JSONObject(schemaJsonString))
+                .draftV7Support()
+                .build();
+        Schema schema = loader.load().build();
+        try {
+            schema.validate(new JSONObject(data));
+        } catch (ValidationException validationException) {
+            throw new JsonValidationException(validationException);
+        }
+    }
+public class JsonValidationException extends RuntimeException {
+
+    private ValidationException validationException;
+
+    public JsonValidationException(ValidationException validationException) {
+        this.validationException = validationException;
+    }
+
+    @Override
+    public String getMessage() {
+        return validationException.getAllMessages().toString();
+    }
+
+}
+ 
+
+执行结果中包含了输入数据包含的6个不符合约定的地方
+
+JsonValidationException: [
+    #/qualifications: expected type: JSONArray, found: Null, 
+    #/address/thirdLine: expected type: String, found: Null, 
+    #/address/secondLine: expected type: String, found: Null, 
+    #/address/firstLine: expected type: String, found: Null, 
+    #/gender: null is not a valid enum value, 
+    #/gender: expected type: String, found: Null
+    ]
+结语
+JSON Schema提供了数据规范语法，JSON Schema 标准经过修订有多个Draft，当前的版本是Draft 202-12,Draft版本不同会略有差异。JSON Schema可以用于校验接口输入数据、自动化测试、甚至可以用其生成代码，jsonschema2pojo就是一个这样的工具，利用JSON Schema在数据约束和校验方面可以提供一些便利。
