@@ -1,0 +1,97 @@
+简短回答：
+MySQL 本身不支持像 MongoDB renameCollection 那样真正的 atomic table swap，但 InnoDB 的 RENAME TABLE 可以实现“接近原子的无间隙替换”，足以满足大多数生产需求。
+
+下面给你详细解释👇
+
+✔ MySQL 是否支持 Atomic Table Swap？
+MySQL 不支持多表的真正原子级别（事务级） swap
+
+但支持原子级的 rename（重命名），并且 rename 在 MySQL 中是一个 atomic 操作。
+
+换句话说：
+
+MySQL 可以通过双重 rename 来做到“表 A 和表 B 原子交换名字”
+
+这是运维界公认的 atomic swap 技巧。
+
+✔ Swap 技巧（经典写法）
+
+假设你想用 new_table 替换 old_table。
+
+方式 A：单向覆盖（replace old table 展开）
+
+创建新表 mytable_new
+
+填充数据
+
+用 rename 实现原子覆盖：
+
+RENAME TABLE
+  mytable TO mytable_old,
+  mytable_new TO mytable;
+
+
+RENAME TABLE 支持 多表一起 rename，并且整个 rename 是原子的。
+
+然后（可选）删除旧表：
+DROP TABLE mytable_old;
+
+✔ 是否真正 Atomic？
+
+是原子的。
+MySQL 文档明确说明：
+
+RENAME TABLE 是一个原子操作；如果涉及多张表，它们会在一次 metadata lock 中切换，成功全部成功，失败全部失败。
+
+也就是说：
+
+不会出现 rename 一半的情况
+
+查询不会看到中间状态
+
+不会有短暂缺表的窗口
+
+这跟 MongoDB 的 renameCollection 十分类似。
+
+✔ 注意事项
+1. 必须是 InnoDB
+
+MyISAM 会锁全库，但 InnoDB 是 metadata lock，成本很低。
+
+2. Rename 不涉及数据搬移（zero data copy）
+
+Rename 只是对表的元数据（metadata）重命名，非常快。
+
+3. 不能跨不同 schema 进行 atomic 多表 rename
+
+如：
+
+db1.tableA → db2.tableB
+
+
+在事务上会拆解成两个 rename，不保证完全 atomic。
+
+同 schema 内是 atomic 的。
+
+✔ 生产中替换整张表的正确流程
+-- 1. 创建新表
+CREATE TABLE users_new LIKE users;
+
+-- 2. 填充数据
+INSERT INTO users_new SELECT ...;
+
+-- 3. 原子替换
+RENAME TABLE
+  users TO users_old,
+  users_new TO users;
+
+✔ 总结
+特性	MySQL	MongoDB
+rename 是否 atomic	✔ 是	✔ 是
+是否支持表 swap	✔ 用 RENAME TABLE 可实现	✔ 用 renameCollection
+是否零拷贝	✔	✔
+是否需要锁	仅 metadata lock	仅 namespace lock
+🔥 最终结论
+
+MySQL 支持 atomic table swap（通过多表 RENAME TABLE 实现）
+虽然不是事务级别 swap，但 rename 是原子的，因此效果完全满足生产需求。
