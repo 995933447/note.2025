@@ -1,0 +1,108 @@
+MongoDB 官方推荐的 无锁数据替换（atomic rename swap） 模式。
+
+你可以：
+
+创建一个新的临时集合
+
+写入完整的新数据
+
+使用 renameCollection 将临时集合原子性替换旧集合
+
+（可选）删除临时集合
+
+这和数据库中的 atomic table swap 很类似。
+
+✔ 覆盖旧集合的 rename 操作写法
+
+MongoDB 提供 dropTarget: true 参数，用于 覆盖目标集合。
+
+cmd := bson.D{
+    {"renameCollection", "mydb.tmp_new_data"},
+    {"to", "mydb.users"}, // 覆盖旧的 users 集合
+    {"dropTarget", true}, // 自动删除 mydb.users
+}
+
+
+这是 原子操作 —— 要么完全替换成功，要么完全失败。不会出现部分写入状态。
+
+✔ 为什么这种方式安全？
+1. renameCollection 是 atomic
+
+它不会出现 rename 到一半失败的问题。
+
+2. 不会锁整库，只会短时间锁 old/new 集合所在 namespace
+
+官方文档说明 rename 操作在 WiredTiger 引擎中是轻量级的。
+
+3. 覆盖（dropTarget: true）是一次性动作
+
+不会出现先 drop 再 rename 导致短暂没有集合的 window。
+
+✔ 推荐流程（对生产友好）
+tmpName := "users_tmp_" + time.Now().Format("20060102150405")
+
+// 1. 写入到临时集合
+tmpCol := client.Database("mydb").Collection(tmpName)
+// ... 批量写入新数据 ...
+
+// 2. rename 覆盖
+cmd := bson.D{
+    {"renameCollection", "mydb." + tmpName},
+    {"to", "mydb.users"}, 
+    {"dropTarget", true},
+}
+
+adminDB := client.Database("admin")
+if err := adminDB.RunCommand(ctx, cmd).Err(); err != nil {
+    return err
+}
+
+// 3. 完成 - 新数据已完全替换旧数据
+
+✔ 注意事项
+1. renameCollection 必须在 admin DB 里执行
+
+否则会报错：
+
+Unauthorized: not authorized on mydb ...
+
+2. 权限需要 dbAdminAnyDatabase 或更高
+3. 跨 DB rename 可以
+
+e.g.:
+
+old_db.tmp_xxx → new_db.target
+
+4. 需要确保 tmp collection 名唯一
+
+避免冲突。
+
+✔ 生产实战中的优雅模式
+A. 先写临时集合
+users_tmp_20251109
+
+B. rename 覆盖旧的 users
+dropTarget: true
+
+C. 完成后立刻删除旧 tmp（可选）
+
+因为 rename 已经用掉 tmp 名称了，tmp 集合已经消失。
+
+✔ 总结
+
+你说的模式：
+
+先写入新集合
+rename 覆盖旧集合
+
+是 最佳实践 👍
+
+适用于：
+
+用新数据原子覆盖旧全量数据
+
+Schema 变化
+
+数据导入替换
+
+蓝绿切换
