@@ -1,0 +1,105 @@
+结论：gRPC 的 metadata 会透传，但不会自动透传。
+也就是说：
+🔹 一次 RPC 的 metadata 不会自动复制到下一次 RPC
+🔹 你必须 手动从 context 取出 metadata，再放回新的 context 里 才能继续传递。
+
+✔️ 为什么不会自动透传？
+
+因为 gRPC 的设计是：
+
+Metadata 属于「本次 RPC 调用」的附加信息
+
+不是全局状态，也不是 context 的固定字段
+
+不会自动在不同的 RPC 调用之间共享
+如代码：
+unc (e *Echo) ProxyEcho(ctx context.Context, req *echo.EchoReq) (*echo.EchoResp, error) {
+	m, _ := metadata.FromIncomingContext(ctx)
+	fmt.Println(m)
+	time.Sleep(time.Second * time.Duration(2))
+	return echo.EchoGRPC().BasicEcho(ctx, req)
+} 这样会透传吗
+
+短结论：不会透传。
+
+❌ 为什么你的写法不会透传？
+
+你写的是：
+
+m, _ := metadata.FromIncomingContext(ctx)
+fmt.Println(m)
+time.Sleep(time.Second * time.Duration(2))
+return echo.EchoGRPC().BasicEcho(ctx, req)
+
+
+关键点：
+
+ctx 是从客户端进来的 Incoming Context
+
+但是 gRPC 客户端调用需要 Outgoing Metadata
+
+gRPC 不会自动把 Incoming Metadata 变成 Outgoing Metadata
+
+➡️ 所以你把 ctx 原封不动传给 BasicEcho，metadata 是不会出去的
+
+正确的透传写法（你需要把 Incoming Metadata 转成 Outgoing）
+
+把 metadata 读出来，再塞回 OutgoingContext：
+
+func (e *Echo) ProxyEcho(ctx context.Context, req *echo.EchoReq) (*echo.EchoResp, error) {
+    md, _ := metadata.FromIncomingContext(ctx)
+    fmt.Println("incoming:", md)
+
+    // 将 incoming metadata 复制到 outgoing（这一步非常关键）
+    outCtx := metadata.NewOutgoingContext(ctx, md)
+
+    time.Sleep(2 * time.Second)
+
+    return echo.EchoGRPC().BasicEcho(outCtx, req)
+}
+
+
+👆 这样就能把 metadata 继续带到下游 RPC。
+
+✔️ 解释为什么默认 ctx 不行？
+
+一个 context 可以同时包含 Incoming 和 Outgoing metadata 吗？
+可以，但 Incoming 不会自动变成 Outgoing。
+
+gRPC 处理模型：
+
+ServerHandler → IncomingMetadata
+
+ClientCall → OutgoingMetadata
+
+两者不自动关联、也不会自动拷贝
+
+只有你主动执行：
+
+metadata.NewOutgoingContext(ctx, md)
+
+
+gRPC 才知道把它发出去。
+
+✔️ 补充：如果需要保留原 income context 的 deadline、cancel？
+
+可以这样写：
+md, _ := metadata.FromIncomingContext(inCtx)
+outCtx := metadata.NewOutgoingContext(inCtx, md)
+
+
+这样：
+
+deadline
+
+超时
+
+cancel
+
+都能继续传递。
+
+✔️ 如果你希望「完全隔离」，复制 deadline：
+outCtx, cancel := context.WithCancel(context.TODO())
+defer cancel()
+md, _ := metadata.FromIncomingContext(inCtx)
+outCtx = metadata.NewOutgoingContext(outCtx, md)
