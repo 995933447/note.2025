@@ -1,0 +1,104 @@
+这不是 bug，而是 Google protobuf 的设计。
+protojson.Marshal 序列化时 永远使用 proto 字段名（驼峰），而不会管你写在 struct 上的 json:"xxx"。
+
+因此你看到的是：
+
+{
+  "collName": "...",
+  "uniqIndexKeys": [...],
+  "jsonSchema": "..."
+}
+
+
+而不是你预期的：
+
+{
+  "coll_name": "...",
+  "uniq_index_keys": [...],
+  "json_schema": "..."
+}
+
+
+这是 protojson 的默认行为。
+
+✔️ 原因：protojson 跟 json.Marshal 完全不同
+
+Proto 的结构体是由 protoc 生成的：
+
+CollName string `protobuf:"bytes,1,opt,name=coll_name,json=collName,proto3" json:"coll_name,omitempty"`
+
+
+但是 protojson.Marshal 不会读这个 json tag，它只读 protobuf:"...,json=collName" 中的这个字段名：
+
+json=collName
+
+
+并将其作为 JSON key。
+
+❗ 想要 snake_case？protojson 默认不支持！
+
+即使你写了：
+
+json:"coll_name"
+
+
+也没用。protojson 不看它。
+
+Google 甚至在文档里明确写了：
+
+protojson 始终使用 proto field name 的 JSON 名称（驼峰）
+
+✔️ 解决方法 1（推荐）：protojson.MarshalOptions{UseProtoNames:true}
+m := protojson.MarshalOptions{
+    UseProtoNames: true, // 输出 proto 中的字段名（snake_case）
+}
+b, _ := m.Marshal(resp)
+fmt.Println(string(b))
+
+
+⚠️ 这行非常关键：
+
+UseProtoNames: true
+
+
+它会让输出变成：
+
+{
+  "coll_name": "xxx",
+  "uniq_index_keys": [...],
+  "json_schema": "..."
+}
+
+✔️ 解决方法 2：不要用 protojson，转成普通结构体再 json.Marshal
+
+你可以写一个转换：
+
+type ConfigSchemaJson struct {
+    CollName      string   `json:"coll_name,omitempty"`
+    IndexKeys     []string `json:"index_keys,omitempty"`
+    UniqIndexKeys []string `json:"uniq_index_keys,omitempty"`
+    JsonSchema    string   `json:"json_schema,omitempty"`
+}
+
+func ToJsonResp(p *ConfigSchema) ConfigSchemaJson {
+    return ConfigSchemaJson{
+        CollName: p.CollName,
+        IndexKeys: p.IndexKeys,
+        UniqIndexKeys: p.UniqIndexKeys,
+        JsonSchema: p.JsonSchema,
+    }
+}
+
+
+然后：
+
+json.Marshal(ToJsonResp(resp))
+
+
+这样完全按你的 json:"xxx" 标签输出。
+
+✔️ 总结
+方式	是否输出 snake_case
+protojson.Marshal	❌ 不会，永远输出驼峰
+protojson.MarshalOptions{UseProtoNames:true}	✔️ 会输出 snake_case
+json.Marshal(普通 struct)	✔️ 会按 json tag 来
