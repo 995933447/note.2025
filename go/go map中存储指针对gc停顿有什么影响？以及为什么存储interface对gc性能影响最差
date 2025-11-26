@@ -350,3 +350,6 @@ m escapes to heap
 map[int]User（最优）	可能不产生	最少	⭐⭐⭐⭐⭐
 map[int]*User	每个元素都在堆上	较多	⭐⭐⭐
 map[int]interface{}	几乎总会逃逸	最多	⭐⭐
+
+
+sync.Map同样适用以上规则。
