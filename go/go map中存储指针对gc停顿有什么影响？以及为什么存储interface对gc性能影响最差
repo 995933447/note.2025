@@ -226,3 +226,127 @@ GC 开销最小
 
 GC 会扫描所有指针、追踪堆对象
 GC 开销成倍提升
+
+
+
+如果存储interface呢
+如果 map 存储 interface，GC 行为会更加复杂，性能甚至可能比 “存指针” 更差。
+下面我给你讲清楚 map 存 interface 的本质行为。
+
+✅ **结论先说：
+
+map 存 interface ≠ map 存值，也 ≠ map 存指针
+它可能会让对象被迫逃逸到堆上，并且 GC 必须额外扫描更多结构。**
+
+🟧 1. interface 内部是什么？
+
+interface 在 Go 中的内部结构是：
+
+非空 interface：
+tab *itab       // 方法表指针
+data unsafe.Pointer // 指向真实数据的位置
+
+
+也就是一个双元素结构体，其中 data 是一个指针。
+
+因此：
+
+✔ interface ALWAYS contains a pointer
+✔ 无论你存什么类型，都有至少一个指针需要 GC 扫描
+
+🟩 2. 看三种 map 对比
+
+假设：
+
+type User struct {
+    ID   int
+    Name string
+}
+
+🟦 A) map[int]User（存值）
+map bucket -> User struct（直接存放）
+
+
+GC 扫描：
+
+bucket 内容
+
+User.Name 指针
+
+这是最轻量的情况。
+
+🟦 B) map[int]*User（存指针）
+map bucket -> *User 指针 -> User struct（堆上）
+
+
+GC 扫描：
+
+bucket 中所有指针
+
+扫描每个指向的 User 对象
+
+再递归扫描 Name
+
+这是第二轻量。
+
+🟥 C) map[int]interface{}（最麻烦）
+
+例如：
+
+m := map[int]interface{}{}
+m[1] = User{ID: 1, Name: "A"}
+
+
+interface 内部是：
+
+map bucket -> interface {
+    itab pointer
+    data pointer -> User struct（可能在堆上）
+}
+
+
+GC 扫描：
+
+bucket 内容
+
+interface.itab 指针
+
+interface.data 指针
+
+指向 User struct（通常被迫逃逸到堆）
+
+再扫描 User.Name 底层指针
+
+⚠ 为什么 interface 会自动逃逸？
+
+因为 interface 存储 "不确定类型" 的值，Go 编译器无法在编译期确定它是否可以放在栈上。
+
+所以通常会：
+
+把值复制到堆上
+然后让 interface.data 指向堆对象。
+
+所以：
+
+🔺 你本想存值 → 最终变成了存指针 + 堆对象 + 额外元数据
+🔺 GC 工作量翻倍
+🔺 性能明显差于 map 存值
+
+🧨 实测例子（Go 官方逃逸分析行为）
+func test() {
+    var m = map[int]interface{}{}
+    u := User{1, "A"}
+    m[0] = u   // u 会逃逸到堆！
+}
+
+
+逃逸分析：
+
+u escapes to heap
+m escapes to heap
+
+🔥 总结表格
+存储方式	是否会产生堆分配	GC 扫描量	性能
+map[int]User（最优）	可能不产生	最少	⭐⭐⭐⭐⭐
+map[int]*User	每个元素都在堆上	较多	⭐⭐⭐
+map[int]interface{}	几乎总会逃逸	最多	⭐⭐
